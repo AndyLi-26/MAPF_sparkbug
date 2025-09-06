@@ -34,7 +34,7 @@ def detect_circles(camera_index=0):
             dp=1.2,
             minDist=30,
             param1=50,
-            param2=30,
+            param2=90,
             minRadius=10,
             maxRadius=200
         )
