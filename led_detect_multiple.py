@@ -1,523 +1,569 @@
 """
-LED Ring Detector – Multi-Robot, Rotation-Invariant ID
+LED-first robot detector (with robust 16-LED sequence):
+- LED masks (HSV) -> DBSCAN clusters -> RANSAC+LS circle fit
+- 48-point annulus sampling from 12 o'clock CW
+- Per-ring adaptive S/V thresholds + hue-distance color classifier
+- 48 -> exact 16 bins (majority per 3 samples), symbols in C/M/Y/G
+- Rotation-invariant ID match (window=6) via external codebook
 
-What this does (high level):
-- Captures frames from an overhead USB camera.
-- Finds circular LED rings via HoughCircles (geometry-first — robust to color noise).
-- Samples a thin annulus around each detected circle at 48 angles (starting at 12 o'clock, going clockwise).
-- Classifies each sample patch as R/G/B/Unknown (U) using HSV thresholds that adapt per ring.
-- Collapses consecutive duplicates and drops Unknown to get a clean sequence, then keeps the first 16 colors.
-- Converts that 16-color sequence to a rotation-invariant “canonical” signature and assigns a stable Robot ID.
-- Tracks rings across frames (simple nearest-neighbor with exponential smoothing).
-- Draws per-ring overlays (circle, sample ticks, live sequence, Robot ID) and a small HUD.
-- Prints per-frame compact summaries you can pipe to your controller layer.
-
-Controls:
-- q : Quit (closes the preview window)
-- f : Toggle fullscreen
-- m : Toggle overlays (useful to see raw camera feed)
-
-Notes:
-- All thresholds are intentionally conservative. Tune RED_TOL / GREEN_CENTER/TOL / BLUE_CENTER/TOL and the adaptive S/V logic to your lighting.
-- Hough parameters determine how aggressively circles are proposed; start from defaults and adjust on your scene.
-- If multiple robots share the exact same 16-LED sequence (up to rotation), they’ll get the same Robot ID (by design).
-- If you want “unique per individual” even when sequences are identical, use `track_id` instead (that is per-visual-track).
+Changes:
+- No 'U' symbols produced anywhere (default fallback -> 'C')
+- Merge near/overlapping circles to avoid duplicate robots
 """
 
 import cv2
 import numpy as np
-import time
-import math
+import math, time, random
 
-# ---------------------- Camera & Frame ----------------------
-CAMERA_INDEX = 0
-FRAME_WIDTH, FRAME_HEIGHT, FRAME_FPS = 1280, 720, 30
+# === External codebook & helpers ===
+import codebook_helpers as cb
 
-# ---------------------- Circle Detection (Hough) ----------------------
-# dp: Inverse ratio of accumulator resolution to image resolution (1.2 = accumulator is ~83% size of image)
-HOUGH_DP = 1.2
-# minDist: Minimum distance between centers of detected circles (pixels)
-HOUGH_MIN_DIST = 30
-# param1: Canny upper threshold (lower is half internally); affects edge detection for Hough
-HOUGH_PARAM1 = 50
-# param2: Accumulator threshold for circle centers (higher -> fewer false circles)
-HOUGH_PARAM2 = 90
-# min/max radius (in pixels) for rings in your scene (rough bounds are fine)
-HOUGH_RADIUS_MIN = 10
-HOUGH_RADIUS_MAX = 200
+# ---------------------- Camera / frame ----------------------
+CAM_INDEX = 0
+FRAME_W, FRAME_H, FRAME_FPS = 1280, 720, 30
 
-# ---------------------- Annulus Sampling ----------------------
-# We sample patches along a thin ring (annulus) just inside/outside the detected circle
-SAMPLES_PER_RING = 48                  # angular samples per ring (12 o'clock CW)
-ANNULUS_INNER_SCALE = 0.85             # inner radius = scale * detected radius
-ANNULUS_OUTER_SCALE = 1.05             # outer radius = scale * detected radius
-PATCH_HALF_SIZE_PX = 4                 # half-size of square patch for voting (patch = (2h+1)^2)
-NUM_SAMPLED_RADII = 3                  # sample that many radii uniformly within the annulus
+# ---------------------- Color model (HSV) ----------------------
+HUE_CENTERS = {'C': 90, 'M': 150, 'Y': 30, 'G': 60}  # cyan, magenta, yellow, soft-green
+HUE_TOL     = {'C': 15, 'M': 15, 'Y': 10, 'G': 12}
+SAT_MIN = 70
+VAL_MIN = 70
 
-# ---------------------- Color Thresholds (HSV) ----------------------
-# Base S and V mins (will be adapted per ring by local percentiles)
-BASE_S_MIN = 120
-BASE_V_MIN = 130
+# ---------------------- Pre-processing ----------------------
+USE_GRAY_WORLD_WB = True
+LINEAR_GAIN = 0.9
+LINEAR_OFFSET = -5
+GAMMA = 1.8
+SAT_GAIN = 2.0
+VAL_GAIN = 1.0
+# --- Extra LED saliency preproc params ---
+CLAHE_CLIP = 2.0                 # 1.5–3.0 is reasonable
+CLAHE_TILE = (8, 8)               # local equalization grid
+TOPHAT_KERNEL = 9                 # size of structuring element for top-hat (odd)
+BG_DIM = 20                     # global dim factor for non-LED regions
+LED_BOOST = 8.0                   # how much to boost LED regions
+LED_V_PERCENTILE = 98             # percentile to define "very bright" pixels
+LED_S_GATE = 120                  # min saturation for saliency (HSV S channel)
 
-# Hue windows (0..179 in OpenCV). Tune to your LEDs.
-RED_TOLERANCE = 14                     # red is special (wraps around 0/179)
-GREEN_HUE_CENTER, GREEN_HUE_TOL = 70, 22
-BLUE_HUE_CENTER,  BLUE_HUE_TOL  = 115, 18
 
-# ---------------------- Preprocessing ----------------------
-APPLY_GRAY_WORLD_WB = True             # simple per-frame gray-world white balance
-LINEAR_GAIN = 0.9                      # brightness/contrast gain (alpha)
-LINEAR_OFFSET = -5                     # brightness offset (beta)
-GAMMA = 1.8                            # gamma correction (>1 = darker mids, helps de-white saturated LEDs)
-SAT_GAIN = 2.0                         # multiply HSV S (saturation)
-VAL_GAIN = 1.2                         # multiply HSV V (value)
+# ---------------------- Clustering ----------------------
+DBSCAN_EPS = 40
+DBSCAN_MIN_SAMPLES = 6
 
-# ---------------------- Tracking & Smoothing ----------------------
-SMOOTH_ALPHA = 0.5                     # EMA weight for center & radius (higher = smoother, slower)
-MATCH_DISTANCE_THRESHOLD = 40.0        # pixels; max distance to link detection to existing track
+# ---------------------- Circle fit & sampling ----------------------
+SAMPLES_AROUND = 48
+ANNULUS_INNER = 0.82
+ANNULUS_OUTER = 1.08
+PATCH_RADIUS  = 5
+RADII_PROBES  = 3
+INLIER_DIST_THRESH = 5.0
+
+# Expected ring size band (px)
+MAX_RING_RADIUS_PX = 70
+MIN_RING_RADIUS_PX = 45
+
+# ------ Duplicate circle suppression (tunable) ------
+MERGE_CENTER_DIST_PX = 15      # if centers closer than this, treat as same robot
+MERGE_OVERLAP_FRAC   = 0.60    # or if center distance < frac * min(radius)
+
+# ---------------------- Tracking ----------------------
+SMOOTH_ALPHA = 0.3
+MATCH_DIST = 50.0
 
 # ---------------------- Visualization ----------------------
-DRAW_OVERLAYS = True
 SHOW_PREVIEW = True
+DRAW_OVERLAYS = True
 
-# ---------------------- Utilities ----------------------
-def clip_u8(arr):
-    """Clamp to [0,255] and convert to uint8."""
-    return np.clip(arr, 0, 255).astype(np.uint8)
 
-def gray_world_white_balance(bgr_img):
-    """Simple gray-world white balance: scale channels so their means are equal."""
-    b, g, r = cv2.split(bgr_img.astype(np.float32))
-    mb, mg, mr = b.mean() + 1e-6, g.mean() + 1e-6, r.mean() + 1e-6
-    mean_all = (mb + mg + mr) / 3.0
-    gb, gg, gr = mean_all / mb, mean_all / mg, mean_all / mr
-    return clip_u8(cv2.merge([b * gb, g * gg, r * gr]))
+# ==== Utilities ===============================================================
+def enhance_for_leds(img_bgr):
+    """
+    Strong, LED-focused preprocessing:
+      1) Gray-world WB (optional in your global flag)
+      2) Linear gain/offset + gamma (your current settings)
+      3) HSV: boost S and V (your SAT_GAIN / VAL_GAIN)
+      4) CLAHE on V + Top-Hat to emphasize small bright blobs
+      5) Build a saliency mask using (V >= p98) & (S >= LED_S_GATE)
+      6) Blend: dim background, boost LED regions
+    Returns:
+      - bgr_view: boosted image for visualization / downstream
+      - hsv_boost: HSV image aligned with bgr_view (for masks/sampling)
+    """
+    # Step 1–2: (we leave gray-world to your global flag, so we only linear + gamma here)
+    base = cv2.convertScaleAbs(img_bgr, alpha=LINEAR_GAIN, beta=LINEAR_OFFSET)
+    base = apply_gamma(base, GAMMA)
 
-def apply_gamma_u8(bgr_img, gamma):
-    """Apply gamma curve using a lookup table (fast)."""
-    if abs(gamma - 1.0) < 1e-3:
-        return bgr_img
-    inv_gamma = 1.0 / max(gamma, 1e-6)
-    lut = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], np.uint8)
-    return cv2.LUT(bgr_img, lut)
+    # Step 3: HSV + global color gains
+    hsv = cv2.cvtColor(base, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:,:,1] = np.clip(hsv[:,:,1] * SAT_GAIN, 0, 255)
+    hsv[:,:,2] = np.clip(hsv[:,:,2] * VAL_GAIN, 0, 255)
 
-# ---------------------- Color Masks (HSV) ----------------------
-def red_mask_from_hsv(hsv_img, tol, s_min, v_min):
-    """Binary mask for RED using wrap-around at hue=0/179."""
-    h, s, v = cv2.split(hsv_img)
-    hue_hit = (h <= tol) | (h >= 180 - tol)
-    return ((hue_hit) & (s >= s_min) & (v >= v_min)).astype(np.uint8) * 255
+    # Step 4: CLAHE on V + Top-Hat (on equalized V)
+    V8 = hsv[:,:,2].astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+    V_eq = clahe.apply(V8)
 
-def color_mask_from_hsv(hsv_img, center, tol, s_min, v_min):
-    """Binary mask for a hue window centered at `center` with ±tol."""
-    h, s, v = cv2.split(hsv_img)
-    lo = (center - tol) % 180
-    hi = (center + tol) % 180
-    if lo <= hi:
-        hue_hit = (h >= lo) & (h <= hi)
-    else:
-        # window crosses 0: accept high or low wrap
-        hue_hit = (h >= lo) | (h <= hi)
-    return ((hue_hit) & (s >= s_min) & (v >= v_min)).astype(np.uint8) * 255
+    ksz = TOPHAT_KERNEL if TOPHAT_KERNEL % 2 == 1 else TOPHAT_KERNEL + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+    V_tophat = cv2.morphologyEx(V_eq, cv2.MORPH_TOPHAT, kernel)
 
-def collapse_consecutive(seq_chars):
-    """Collapse consecutive duplicates: e.g., R R G G U R -> R G U R."""
-    if not seq_chars:
-        return []
-    out = [seq_chars[0]]
-    for c in seq_chars[1:]:
-        if c != out[-1]:
-            out.append(c)
+    # Combine V components: keep some equalized V, add tophat to highlight LEDs
+    V_boost = np.clip(0.7 * V_eq + 1.3 * V_tophat, 0, 255).astype(np.uint8)
+
+    # Step 5: LED saliency mask (using robust V threshold + saturation gate)
+    V_thresh = np.percentile(V_boost, LED_V_PERCENTILE)
+    S8 = hsv[:,:,1].astype(np.uint8)
+    led_mask = ((V_boost >= V_thresh) & (S8 >= LED_S_GATE)).astype(np.uint8) * 255
+    # optional cleanup
+    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    led_mask = cv2.morphologyEx(led_mask, cv2.MORPH_OPEN, k_small, iterations=1)
+
+    # Step 6: Compose boosted view: dim background, boost LED regions
+    hsv_boost = hsv.copy()
+    hsv_boost[:,:,2] = V_boost
+
+    bgr_boost = cv2.cvtColor(hsv_boost.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+    base_dim  = (base.astype(np.float32) * BG_DIM)
+
+    mask_f = (led_mask.astype(np.float32) / 255.0)[:,:,None]
+    # On LED regions: boost further; elsewhere: dim
+    bgr_view = base_dim * (1.0 - mask_f) + (bgr_boost * LED_BOOST) * mask_f
+    bgr_view = clip8(bgr_view)
+
+    # Keep an HSV aligned with bgr_view for downstream color masks/sampling
+    hsv_view = cv2.cvtColor(bgr_view, cv2.COLOR_BGR2HSV)
+
+    return bgr_view, hsv_view
+
+
+def clip8(x): return np.clip(x, 0, 255).astype(np.uint8)
+
+def gray_world(img_bgr):
+    b,g,r = cv2.split(img_bgr.astype(np.float32))
+    mb, mg, mr = b.mean()+1e-6, g.mean()+1e-6, r.mean()+1e-6
+    m = (mb + mg + mr)/3.0
+    return clip8(cv2.merge([b*(m/mb), g*(m/mg), r*(m/mr)]))
+
+def apply_gamma(img_bgr, gamma):
+    if abs(gamma - 1.0) < 1e-3: return img_bgr
+    inv = 1.0 / max(gamma, 1e-6)
+    lut = np.array([((i/255.0)**inv)*255 for i in range(256)], np.uint8)
+    return cv2.LUT(img_bgr, lut)
+
+def collapse_runs(seq):
+    if not seq: return []
+    out=[seq[0]]
+    for c in seq[1:]:
+        if c != out[-1]: out.append(c)
     return out
 
-def drop_unknown_and_collapse(seq_chars):
-    """Drop 'U' (unknown) and collapse runs; result only has 'R','G','B'."""
-    return [c for c in collapse_consecutive(seq_chars) if c in ('R', 'G', 'B')]
+# ==== Masks for finding LED blobs ============================================
+def hue_band_mask(hsv_img, hue_center, hue_tol, s_min, v_min):
+    h,s,v = cv2.split(hsv_img)
+    lo = (hue_center - hue_tol) % 180
+    hi = (hue_center + hue_tol) % 180
+    hue_ok = (h >= lo) & (h <= hi) if lo <= hi else ((h >= lo) | (h <= hi))
+    return ((hue_ok) & (s >= s_min) & (v >= v_min)).astype(np.uint8) * 255
 
-def first_16(seq_chars):
-    """Take the first 16 tokens (or fewer if not available)."""
-    return seq_chars[:16]
+def build_color_masks(hsv_img):
+    masks = {}
+    k = np.ones((3,3), np.uint8)
+    for sym, hc in HUE_CENTERS.items():
+        m = hue_band_mask(hsv_img, hc, HUE_TOL[sym], SAT_MIN, VAL_MIN)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+        masks[sym] = m
+    return masks
 
-# ---------------------- Sampling & Adaptation ----------------------
-def sample_ring_sequence(
-    hsv_img, cx, cy, radius,
-    num_angles, inner_scale, outer_scale, patch_half_size, num_radii,
-    s_min, v_min
-):
+def find_blob_centroids(mask):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    pts=[]
+    for c in cnts:
+        if len(c) < 3: continue
+        if cv2.contourArea(c) < 3: continue
+        M = cv2.moments(c)
+        if M['m00'] > 0:
+            cx = int(M['m10']/M['m00']); cy = int(M['m01']/M['m00'])
+            pts.append((cx, cy))
+    return pts
+
+def detect_led_blobs(hsv_img):
+    masks = build_color_masks(hsv_img)
+    all_pts=[]; all_syms=[]
+    for sym, m in masks.items():
+        pts = find_blob_centroids(m)
+        all_pts.extend(pts)
+        all_syms.extend([sym]*len(pts))
+    return np.array(all_pts, dtype=np.int32), all_syms
+
+# ==== DBSCAN ==================================================================
+def dbscan(points, eps, min_pts):
+    if len(points) == 0: return []
+    P = points.astype(np.float32)
+    n = len(P)
+    visited = np.zeros(n, dtype=bool)
+    labels  = np.full(n, -1, dtype=int)
+    cid = 0
+    for i in range(n):
+        if visited[i]: continue
+        visited[i] = True
+        d = np.hypot(P[:,0]-P[i,0], P[:,1]-P[i,1])
+        neigh = np.where(d <= eps)[0]
+        if len(neigh) < min_pts:
+            labels[i] = -1; continue
+        labels[neigh] = cid
+        queue = list(neigh)
+        for j in queue:
+            if not visited[j]:
+                visited[j] = True
+                d2 = np.hypot(P[:,0]-P[j,0], P[:,1]-P[j,1])
+                neigh2 = np.where(d2 <= eps)[0]
+                if len(neigh2) >= min_pts:
+                    for k in neigh2:
+                        if labels[k] == -1: labels[k] = cid
+                        if k not in queue: queue.append(k)
+        cid += 1
+    return [np.where(labels==k)[0].tolist() for k in range(cid)]
+
+# ==== Circle fitting ==========================================================
+def circle_from_3pts(p1, p2, p3):
+    (x1,y1),(x2,y2),(x3,y3) = p1, p2, p3
+    temp = x2**2 + y2**2
+    bc = (x1**2 + y1**2 - temp)/2.0
+    cd = (temp - x3**2 - y3**2)/2.0
+    det = (x1-x2)*(y2-y3) - (x2-x3)*(y1-y2)
+    if abs(det) < 1e-6: return None
+    cx = (bc*(y2-y3) - cd*(y1-y2)) / det
+    cy = ((x1-x2)*cd - (x2-x3)*bc) / det
+    r  = math.hypot(x1-cx, y1-cy)
+    return (cx, cy, r)
+
+def fit_circle_least_squares(pts):
+    x = pts[:,0].astype(np.float64); y = pts[:,1].astype(np.float64)
+    xm, ym = x.mean(), y.mean()
+    u = x - xm; v = y - ym
+    Suu = (u*u).sum(); Svv = (v*v).sum(); Suv = (u*v).sum()
+    Suuu = (u*u*u).sum(); Svvv = (v*v*v).sum()
+    Suvv = (u*v*v).sum(); Svuu = (v*u*u).sum()
+    A = np.array([[Suu, Suv],[Suv, Svv]], np.float64)
+    b = np.array([0.5*(Suuu + Suvv), 0.5*(Svvv + Svuu)], np.float64)
+    if abs(np.linalg.det(A)) < 1e-9: return None
+    uc, vc = np.linalg.solve(A, b)
+    cx = xm + uc; cy = ym + vc
+    r  = np.mean(np.hypot(x - cx, y - cy))
+    return (cx, cy, r)
+
+def fit_circle_ransac(pts_xy, trials=64, inlier_thresh=INLIER_DIST_THRESH):
+    pts = np.asarray(pts_xy, dtype=np.float32)
+    if len(pts) < 3: return None, None
+    best = None; best_inliers = []
+    n = len(pts)
+    for _ in range(trials):
+        i1, i2, i3 = random.sample(range(n), 3)
+        circ = circle_from_3pts(pts[i1], pts[i2], pts[i3])
+        if circ is None: continue
+        cx, cy, r = circ
+        d = np.abs(np.hypot(pts[:,0]-cx, pts[:,1]-cy) - r)
+        inliers = np.where(d <= inlier_thresh)[0]
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best = (cx, cy, r)
+    if best is None or len(best_inliers) < 3:
+        return None, None
+    refined = fit_circle_least_squares(pts[best_inliers])
+    return refined, best_inliers
+
+# === Adaptive thresholds from the ring annulus ===============================
+def estimate_ring_thresholds(hsv_img, cx, cy, r, rin_pct=ANNULUS_INNER, rout_pct=ANNULUS_OUTER):
+    H, W = hsv_img.shape[:2]
+    rin = max(1, int(r * rin_pct))
+    rout = max(rin+1, int(r * rout_pct))
+    Y, X = np.ogrid[:H, :W]
+    rsq = (X - cx)**2 + (Y - cy)**2
+    mask = (rsq >= rin*rin) & (rsq <= rout*rout)
+    if not np.any(mask):
+        return SAT_MIN, VAL_MIN
+    s = hsv_img[:,:,1][mask].astype(np.float32)
+    v = hsv_img[:,:,2][mask].astype(np.float32)
+    s_gate = int(np.clip(np.percentile(s, 65) * 0.9, 60, 255))
+    v_gate = int(np.clip(np.percentile(v, 95) * 0.8, 60, 255))
+    return s_gate, v_gate
+
+# === Hue-distance classifier; NEVER returns 'U' ==============================
+def classify_patch_hsv(hsv_patch, s_gate, v_gate):
     """
-    For one ring:
-    - Sample `num_angles` around the circle from 12 o'clock clockwise.
-    - For each angle, evaluate multiple radii within the annulus.
-    - Each sample votes R/G/B by counting pixels within that patch from the 3 masks.
-    - Choose the color with the highest count; 'U' if no count > 0.
-    Returns:
-    - raw_48:     raw sequence length `num_angles` incl. 'U'
-    - collapsed:  collapsed/no-U sequence
-    - inner_px:   inner radius (for drawing)
-    - outer_px:   outer radius (for drawing)
+    Return 'C','M','Y','G'. If patch too dim/unsaturated or far from all hues,
+    we default to 'C' to avoid any 'U' in downstream logic.
     """
-    height, width = hsv_img.shape[:2]
-    # Angle list: start at 12 o'clock (pi/2), go clockwise
-    thetas = (np.pi / 2.0) - (2.0 * np.pi * np.arange(num_angles) / float(num_angles))
+    h = hsv_patch[...,0].astype(np.float32)
+    s = hsv_patch[...,1].astype(np.float32)
+    v = hsv_patch[...,2].astype(np.float32)
 
-    inner_radius = radius * inner_scale
-    outer_radius = radius * outer_scale
-    radii_to_sample = np.linspace(inner_radius, outer_radius, max(1, num_radii))
+    mS = float(np.mean(s)); mV = float(np.mean(v))
+    # If below gates, fallback to 'C'
+    if mS < s_gate or mV < v_gate:
+        return 'C'
 
-    mask_red   = red_mask_from_hsv(hsv_img, RED_TOLERANCE, s_min, v_min)
-    mask_green = color_mask_from_hsv(hsv_img, GREEN_HUE_CENTER, GREEN_HUE_TOL, s_min, v_min)
-    mask_blue  = color_mask_from_hsv(hsv_img, BLUE_HUE_CENTER,  BLUE_HUE_TOL,  s_min, v_min)
+    # circular mean hue
+    ang = h * (np.pi/90.0)
+    c = np.cos(ang); s_ = np.sin(ang)
+    mean_ang = math.atan2(np.mean(s_), np.mean(c))
+    if mean_ang < 0: mean_ang += 2*np.pi
+    mean_h = mean_ang * (90.0/np.pi)
 
-    seq_raw = []
-    for theta in thetas:
-        best_color = 'U'
-        best_vote = -1
-        for r_test in radii_to_sample:
-            px = int(round(cx + r_test * math.cos(theta)))
-            py = int(round(cy - r_test * math.sin(theta)))  # screen y grows downward
-            if 0 <= px < width and 0 <= py < height:
-                x0, x1 = max(0, px - patch_half_size), min(width,  px + patch_half_size + 1)
-                y0, y1 = max(0, py - patch_half_size), min(height, py + patch_half_size + 1)
-                vote_r = int(np.count_nonzero(mask_red[y0:y1,   x0:x1]))
-                vote_g = int(np.count_nonzero(mask_green[y0:y1, x0:x1]))
-                vote_b = int(np.count_nonzero(mask_blue[y0:y1,  x0:x1]))
-                vote = max(vote_r, vote_g, vote_b)
-                if vote > best_vote and vote > 0:
-                    best_vote = vote
-                    best_color = 'R' if vote == vote_r else ('G' if vote == vote_g else 'B')
-        seq_raw.append(best_color)
+    # nearest hue center
+    best_sym='C'; best_d=1e9
+    for sym, hc in HUE_CENTERS.items():
+        d = abs(mean_h - hc)
+        d = min(d, 180 - d)
+        if d < best_d:
+            best_d = d; best_sym = sym
 
-    collapsed_no_u = drop_unknown_and_collapse(seq_raw)
-    return seq_raw, collapsed_no_u, int(inner_radius), int(outer_radius)
+    # Guard: if exceedingly far, still default to 'C'
+    return best_sym if best_d <= max(HUE_TOL.values()) else 'C'
 
-def adapt_sv_thresholds_within_annulus(hsv_img, cx, cy, radius, inner_scale, outer_scale):
-    """
-    Compute S/V thresholds per ring from local annulus statistics.
-    Idea: LEDs are among the brightest/saturated pixels near the ring.
-    - S_min ~ 0.8 * 75th percentile of saturation
-    - V_min ~ 0.5 * 98th percentile of value
-    Clamped to a floor relative to BASE_S_MIN/BASE_V_MIN.
-    """
-    height, width = hsv_img.shape[:2]
-    inner_r = int(max(1, radius * inner_scale))
-    outer_r = int(max(inner_r + 1, radius * outer_scale))
+# === 48-sample sequence with multi-radius voting; NEVER yields 'U' ===========
+def sample_sequence_symbols(hsv_img, cx, cy, r):
+    H, W = hsv_img.shape[:2]
+    thetas = (np.pi/2) - (2.0*np.pi*np.arange(SAMPLES_AROUND)/float(SAMPLES_AROUND))
+    rin = r * ANNULUS_INNER
+    rout = r * ANNULUS_OUTER
+    radii = np.linspace(rin, rout, max(1, RADII_PROBES))
 
-    Y, X = np.ogrid[:height, :width]
-    rsq = (X - cx) ** 2 + (Y - cy) ** 2
-    annulus_mask = (rsq >= inner_r * inner_r) & (rsq <= outer_r * outer_r)
+    s_gate, v_gate = estimate_ring_thresholds(hsv_img, int(cx), int(cy), r)
 
-    s_vals = hsv_img[:, :, 1][annulus_mask].astype(np.float32)
-    v_vals = hsv_img[:, :, 2][annulus_mask].astype(np.float32)
-    if s_vals.size == 0:
-        return BASE_S_MIN, BASE_V_MIN
+    seq=[]
+    for th in thetas:
+        votes = {'C':0, 'M':0, 'Y':0, 'G':0}
+        for rr in radii:
+            px = int(round(cx + rr*math.cos(th)))
+            py = int(round(cy - rr*math.sin(th)))
+            if 0 <= px < W and 0 <= py < H:
+                x0, x1 = max(0, px-PATCH_RADIUS), min(W, px+PATCH_RADIUS+1)
+                y0, y1 = max(0, py-PATCH_RADIUS), min(H, py+PATCH_RADIUS+1)
+                patch = hsv_img[y0:y1, x0:x1]
+                sym = classify_patch_hsv(patch, s_gate, v_gate)  # returns C/M/Y/G
+                votes[sym] += 1
+        # choose best; default remains 'C'
+        best_sym, best_count = 'C', -1
+        for sym in ('C','M','Y','G'):
+            if votes[sym] > best_count:
+                best_count = votes[sym]; best_sym = sym
+        seq.append(best_sym)
+    return seq
 
-    s75 = np.percentile(s_vals, 75)
-    v98 = np.percentile(v_vals, 98)
-    s_min = int(max(BASE_S_MIN * 0.8, min(255, s75 * 0.8)))
-    v_min = int(max(BASE_V_MIN * 0.7, min(255, v98 * 0.5)))
-    return s_min, v_min
+# === 48 -> exact 16; NEVER yields 'U' ========================================
+def samples48_to_exact16(seq48):
+    out=[]
+    for i in range(16):
+        chunk = seq48[3*i : 3*i + 3]
+        counts = {'C':0,'M':0,'Y':0,'G':0}
+        for c in chunk:
+            if c in counts: counts[c] += 1
+        # if all zero (shouldn't happen now), default to 'C'
+        best_sym = max(counts.items(), key=lambda kv: kv[1])[0]
+        out.append(best_sym if counts[best_sym] > 0 else 'C')
+    return out
 
-# ---------------------- Rotation-Invariant Signature & IDs ----------------------
-def canonical_rotation(seq16):
-    """
-    Make sequence rotation-invariant by choosing the lexicographically smallest rotation.
-    If not exactly 16, return tuple as-is (not considered stable yet).
-    """
-    if not seq16 or len(seq16) != 16:
-        return tuple(seq16)
-    s = seq16[:]
-    rotations = [tuple(s[i:] + s[:i]) for i in range(len(s))]
-    return min(rotations)
+# ==== Rotation-invariant matching (fallback, not used if your cb has it) =====
+def match_id_rotation_window(seq16_syms, codebook_num, window=6):
+    if len(seq16_syms) < window: return (None, 0)
+    try:
+        obs_int = cb.syms_to_ints(seq16_syms)
+    except AttributeError:
+        sym2idx = {'C':0,'M':1,'Y':2,'G':3}
+        obs_int = [sym2idx[s] for s in seq16_syms]
 
-# Registry that maps canonical 16-token sequences -> incremental Robot ID
-ROBOT_REGISTRY = {}     # { canonical_tuple : robot_id }
-NEXT_ROBOT_ID = 1       # increment as new unique sequences appear
+    best_idx, best_score = None, -1
+    for idx, code in enumerate(codebook_num):
+        for rot in range(16):
+            rotcode = code[rot:] + code[:rot]
+            for j in range(16 - window + 1):
+                score = sum(1 for a,b in zip(obs_int[j:j+window], rotcode[j:j+window]) if a==b)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+    return (best_idx, best_score)
 
-# ---------------------- Track Class (per visual circle) ----------------------
-NEXT_TRACK_ID = 0
-
+# ==== Track ===================================================================
 class Track:
-    """A visual track for one detected ring (smoothed center/radius + last sequence info)."""
-    def __init__(self, center_x, center_y, radius):
-        global NEXT_TRACK_ID
-        self.track_id = NEXT_TRACK_ID; NEXT_TRACK_ID += 1
+    def __init__(self, cx, cy, r):
+        self.cx = float(cx); self.cy = float(cy); self.r = float(r)
+        self.missed = 0
+        self.last_seq16 = None
+        self.streak16 = 0
 
-        # State (smoothed)
-        self.center_x = float(center_x)
-        self.center_y = float(center_y)
-        self.radius   = float(radius)
+    def update(self, cx, cy, r, alpha=SMOOTH_ALPHA):
+        self.cx = alpha*self.cx + (1-alpha)*float(cx)
+        self.cy = alpha*self.cy + (1-alpha)*float(cy)
+        self.r  = alpha*self.r  + (1-alpha)*float(r)
+        self.missed = 0
 
-        # Bookkeeping
-        self.missed_frames = 0
-
-        # Sequence/stability
-        self.last_seq16 = None   # last 16-length sequence list
-        self.seq_streak = 0      # how many consecutive frames the 16-seq stayed identical
-
-        # Identity
-        self.robot_id = None     # assigned from rotation-invariant signature
-
-    def update_ema(self, center_x, center_y, radius, alpha=SMOOTH_ALPHA):
-        """EMA smoothing for center/radius; resets missed counter."""
-        self.center_x = alpha * self.center_x + (1.0 - alpha) * float(center_x)
-        self.center_y = alpha * self.center_y + (1.0 - alpha) * float(center_y)
-        self.radius   = alpha * self.radius   + (1.0 - alpha) * float(radius)
-        self.missed_frames = 0
-
-# ---------------------- Simple Nearest-Neighbor Tracker ----------------------
-def match_and_update_tracks(existing_tracks, current_detections):
-    """
-    Greedily match each existing track to the nearest unclaimed detection within a distance threshold.
-    Unmatched detections create new tracks. Tracks that go missing for a few frames are dropped.
-    """
-    used = [False] * len(current_detections)
-
-    # Try to update existing tracks with closest detection
-    for tr in existing_tracks:
-        best_j = -1
-        best_dist = 1e9
-        for j, (x, y, r) in enumerate(current_detections):
-            if used[j]:
-                continue
-            d = math.hypot(tr.center_x - x, tr.center_y - y)
-            if d < best_dist:
-                best_dist = d
-                best_j = j
-
-        if best_j >= 0 and best_dist <= MATCH_DISTANCE_THRESHOLD:
-            x, y, r = current_detections[best_j]
-            tr.update_ema(x, y, r)
-            used[best_j] = True
+def associate_tracks(tracks, circles):
+    used = [False]*len(circles)
+    for tr in tracks:
+        best_j=-1; best_d=1e9
+        for j,(cx,cy,r) in enumerate(circles):
+            if used[j]: continue
+            d=math.hypot(tr.cx-cx, tr.cy-cy)
+            if d < best_d:
+                best_d=d; best_j=j
+        if best_j>=0 and best_d<=MATCH_DIST:
+            cx,cy,r = circles[best_j]
+            tr.update(cx,cy,r)
+            used[best_j]=True
         else:
-            tr.missed_frames += 1
-
-    # Add new tracks for unmatched detections
-    for j, (x, y, r) in enumerate(current_detections):
+            tr.missed += 1
+    for j,(cx,cy,r) in enumerate(circles):
         if not used[j]:
-            existing_tracks.append(Track(x, y, r))
+            tracks.append(Track(cx,cy,r))
+    return [t for t in tracks if t.missed <= 5]
 
-    # Keep only active tracks (allow up to 5 consecutive misses)
-    active_tracks = [tr for tr in existing_tracks if tr.missed_frames <= 5]
-    return active_tracks
+# ==== Merge near/overlapping circles to avoid duplicates =====================
+def merge_circles(circles, center_dist_px=MERGE_CENTER_DIST_PX, overlap_frac=MERGE_OVERLAP_FRAC):
+    """
+    Greedy NMS-style merge:
+    - Sort by radius descending (keep larger ring as representative)
+    - Discard any circle whose center is very close to a kept one
+      or whose center distance is less than overlap_frac * min(radii)
+    """
+    if not circles: return []
+    # sort larger first
+    circles_sorted = sorted(circles, key=lambda c: c[2], reverse=True)
+    kept = []
+    for (cx,cy,r) in circles_sorted:
+        dup = False
+        for (kx,ky,kr) in kept:
+            d = math.hypot(cx-kx, cy-ky)
+            if d <= center_dist_px or d <= overlap_frac * min(r, kr):
+                dup = True
+                break
+        if not dup:
+            kept.append((cx,cy,r))
+    return kept
 
-# ---------------------- Main Loop ----------------------
+# ==== Main ===================================================================
 def main():
-    global NEXT_ROBOT_ID, ROBOT_REGISTRY
-
-    # --- Open camera ---
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_ANY)
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_ANY)
     if not cap.isOpened():
         raise RuntimeError("Camera open failed")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS,          FRAME_FPS)
 
-    show_overlays = DRAW_OVERLAYS
-    tracks = []
-
-    # HUD “best” (just for the top line; not used for logic)
-    hud_best_seq = None
-    hud_best_streak = 0
-
-    # Prepare preview window
     if SHOW_PREVIEW:
-        cv2.namedWindow("LED Preview", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("LED Preview", 1280, 720)
+        cv2.namedWindow("LED Robots", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("LED Robots", 1280, 720)
 
-    last_time = time.time()
+    tracks=[]
+    last_t=time.time()
 
-    # --- Frame loop ---
     while True:
-        ok, frame_bgr = cap.read()
+        ok, frame = cap.read()
         if not ok:
-            # If the camera starves, don’t crash; just wait a moment.
-            time.sleep(0.005)
-            continue
+            time.sleep(0.005); continue
 
-        # ----- Preprocess (WB -> gain/offset -> gamma -> HSV adapt S/V -> back to BGR for Hough) -----
-        img_bgr = frame_bgr
-        if APPLY_GRAY_WORLD_WB:
-            img_bgr = gray_world_white_balance(img_bgr)
+        # ---- Preproc ----
+        img = frame
+        if USE_GRAY_WORLD_WB:
+            img = gray_world(img)
 
-        img_bgr = cv2.convertScaleAbs(img_bgr, alpha=LINEAR_GAIN, beta=LINEAR_OFFSET)
-        img_bgr = apply_gamma_u8(img_bgr, GAMMA)
+        bgr_for_view, hsv = enhance_for_leds(img)
 
-        hsv_tmp = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv_tmp[:, :, 1] = np.clip(hsv_tmp[:, :, 1] * SAT_GAIN, 0, 255)
-        hsv_tmp[:, :, 2] = np.clip(hsv_tmp[:, :, 2] * VAL_GAIN, 0, 255)
-        hsv_for_color = hsv_tmp.astype(np.uint8)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:,:,1] = np.clip(hsv[:,:,1] * SAT_GAIN, 0, 255)
+        hsv[:,:,2] = np.clip(hsv[:,:,2] * VAL_GAIN, 0, 255)
+        hsv = hsv.astype(np.uint8)
+        bgr_for_view = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-        # Convert back to BGR for circle detection (Hough likes grayscale of BGR)
-        bgr_for_hough = cv2.cvtColor(hsv_for_color, cv2.COLOR_HSV2BGR)
+        # ---- LED blobs ----
+        pts, _ = detect_led_blobs(hsv)
 
-        # ----- Circle detection (Hough) -----
-        gray = cv2.cvtColor(bgr_for_hough, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (9, 9), 2)
-        circles = cv2.HoughCircles(
-            gray_blur, cv2.HOUGH_GRADIENT,
-            dp=HOUGH_DP, minDist=HOUGH_MIN_DIST,
-            param1=HOUGH_PARAM1, param2=HOUGH_PARAM2,
-            minRadius=HOUGH_RADIUS_MIN, maxRadius=HOUGH_RADIUS_MAX
-        )
+        # ---- Clusters -> circles ----
+        circles=[]
+        if len(pts) > 0:
+            cluster_indices = dbscan(pts, eps=DBSCAN_EPS, min_pts=DBSCAN_MIN_SAMPLES)
+            for idxs in cluster_indices:
+                if len(idxs) < 3: continue
+                cl_pts = pts[idxs]
 
-        # Keep circles that are not extremely overlapping (rudimentary NMS)
-        current_detections = []
-        if circles is not None:
-            proposed = np.round(circles[0]).astype(np.int32)
-            kept = []
-            for (x, y, r) in proposed:
-                too_close = any(math.hypot(x - x0, y - y0) <= 0.25 * min(r, r0) for (x0, y0, r0) in kept)
-                if not too_close:
-                    kept.append((x, y, r))
-            current_detections = kept
+                circ, inliers = fit_circle_ransac(cl_pts, trials=64, inlier_thresh=INLIER_DIST_THRESH)
+                if circ is None: continue
+                cx, cy, r = circ
 
-        # ----- Update tracks -----
-        tracks = match_and_update_tracks(tracks, current_detections)
+                refined = fit_circle_least_squares(cl_pts[inliers]) if inliers is not None else circ
+                if refined is None: continue
+                cx, cy, r = refined
 
-        # Visualization buffer
-        preview_bgr = bgr_for_hough.copy()
-        hsv_for_sampling = cv2.cvtColor(bgr_for_hough, cv2.COLOR_BGR2HSV)
+                if r < MIN_RING_RADIUS_PX or r > MAX_RING_RADIUS_PX:
+                    continue
 
-        # Draw origin & axes (OpenCV origin is top-left)
-        if SHOW_PREVIEW and show_overlays:
-            cv2.rectangle(preview_bgr, (0, 0), (6, 6), (0, 0, 255), -1)  # small red square at origin
-            cv2.arrowedLine(preview_bgr, (0, 0), (70, 0), (255, 255, 255), 1, tipLength=0.25)  # +x to the right
-            cv2.arrowedLine(preview_bgr, (0, 0), (0, 70), (255, 255, 255), 1, tipLength=0.25)  # +y downward
-            cv2.putText(preview_bgr, "origin (0,0)", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(preview_bgr, "x->", (74, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(preview_bgr, "y v", (6, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                circles.append((cx,cy,r))
 
-        # ----- Per-ring sampling & identification -----
-        per_frame_output = []  # collect info for this frame (for printing/logging/IPC)
+        # --- Merge duplicates before tracking ---
+        circles = merge_circles(circles)
+
+        # ---- Track robots across frames ----
+        tracks = associate_tracks(tracks, circles)
+
+        # ---- Per-robot sequence & ID ----
+        vis = bgr_for_view.copy()
+        hsv_for_sampling = cv2.cvtColor(bgr_for_view, cv2.COLOR_BGR2HSV)
+
         for tr in tracks:
-            cx = int(round(tr.center_x))
-            cy = int(round(tr.center_y))
-            radius = float(tr.radius)
+            cx, cy, r = tr.cx, tr.cy, tr.r
 
-            # Local S/V thresholds from the annulus
-            s_min, v_min = adapt_sv_thresholds_within_annulus(
-                hsv_for_sampling, cx, cy, radius,
-                ANNULUS_INNER_SCALE, ANNULUS_OUTER_SCALE
-            )
+            # 48 raw samples with classifier (C/M/Y/G only)
+            raw48 = sample_sequence_symbols(hsv_for_sampling, cx, cy, r)
 
-            # Sample around the ring
-            raw_48, collapsed_no_u, inner_px, outer_px = sample_ring_sequence(
-                hsv_for_sampling, cx, cy, radius,
-                SAMPLES_PER_RING, ANNULUS_INNER_SCALE, ANNULUS_OUTER_SCALE,
-                PATCH_HALF_SIZE_PX, NUM_SAMPLED_RADII,
-                s_min, v_min
-            )
-            seq16 = first_16(collapsed_no_u)
+            # exact 16 symbols, no 'U'
+            seq16_exact = samples48_to_exact16(raw48)
+            display_seq = seq16_exact  # keep positional info
 
-            # Log robot center every frame (helps you line up geometry & intrinsics)
-            print(f"robot center: ({cx}, {cy})")
+            # streak (for stable label)
+            if tr.last_seq16 == display_seq:
+                tr.streak16 += 1
+            else:
+                tr.last_seq16 = display_seq[:]
+                tr.streak16 = 1
 
-            # Track-internal stability: how long the seq16 stayed identical
-            if len(seq16) == 16:
-                if tr.last_seq16 is not None and tr.last_seq16 == seq16:
-                    tr.seq_streak += 1
+            # Optional: rotation-invariant match (window=6)
+            if len(display_seq) >= 6:
+                if hasattr(cb, 'match_id_rotation_window'):
+                    best_idx, score = cb.match_id_rotation_window(display_seq, cb.CODEBOOK_NUM, window=6)
                 else:
-                    tr.last_seq16 = seq16[:]
-                    tr.seq_streak = 1
+                    best_idx, score = match_id_rotation_window(display_seq, cb.CODEBOOK_NUM, window=6)
+            else:
+                best_idx, score = (None, 0)
 
-                # Update HUD-best (purely cosmetic)
-                if tr.seq_streak > hud_best_streak:
-                    hud_best_streak = tr.seq_streak
-                    hud_best_seq = seq16[:]
+            # ---- Draw overlays ----
+            if SHOW_PREVIEW and DRAW_OVERLAYS:
+                icx, icy, ir = int(round(cx)), int(round(cy)), int(round(r))
+                cv2.circle(vis, (icx, icy), ir, (0,255,0), 2)
+                cv2.circle(vis, (icx, icy), 2, (0,0,255), -1)
+                cv2.circle(vis, (icx, icy), int(round(r*ANNULUS_INNER)), (255,255,0), 1)
+                cv2.circle(vis, (icx, icy), int(round(r*ANNULUS_OUTER)), (255,255,0), 1)
 
-            # Rotation-invariant signature -> Robot ID
-            robot_id_to_draw = tr.robot_id
-            if len(seq16) == 16:
-                canon = canonical_rotation(seq16)
-                if canon in ROBOT_REGISTRY:
-                    robot_id_to_draw = ROBOT_REGISTRY[canon]
-                else:
-                    robot_id_to_draw = NEXT_ROBOT_ID
-                    ROBOT_REGISTRY[canon] = robot_id_to_draw
-                    NEXT_ROBOT_ID += 1
-                tr.robot_id = robot_id_to_draw  # persist
+                # optional tick marks
+                for i in range(SAMPLES_AROUND):
+                    th = (math.pi/2) - (2.0*math.pi*i/float(SAMPLES_AROUND))
+                    px = int(round(cx + r*math.cos(th)))
+                    py = int(round(cy - r*math.sin(th)))
+                    cv2.circle(vis, (px, py), 1, (255,255,255), -1)
 
-            # ----- Overlays -----
-            if SHOW_PREVIEW and show_overlays:
-                # Circle + center
-                cv2.circle(preview_bgr, (cx, cy), int(radius), (0, 255, 0), 2)
-                cv2.circle(preview_bgr, (cx, cy), 2, (0, 0, 255), -1)
+                live = ' '.join(display_seq) if display_seq else '-'
+                label = f"{live}"
+                if best_idx is not None:
+                    label += f"   ID:{best_idx}  w6:{score}"
+                cv2.putText(vis, label, (icx+12, icy-12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2, cv2.LINE_AA)
 
-                # Annulus bounds (for your reference)
-                cv2.circle(preview_bgr, (cx, cy), inner_px, (255, 255, 0), 1)
-                cv2.circle(preview_bgr, (cx, cy), outer_px, (255, 255, 0), 1)
-
-                # Angular ticks (where samples are taken)
-                for i in range(SAMPLES_PER_RING):
-                    theta = (np.pi / 2.0) - (2.0 * np.pi * i / float(SAMPLES_PER_RING))
-                    px = int(round(cx + radius * math.cos(theta)))
-                    py = int(round(cy - radius * math.sin(theta)))
-                    preview_bgr = cv2.circle(preview_bgr, (px, py), 1, (255, 255, 255), -1)
-
-                # Live per-ring 16-sequence (shows '-' until 16 available)
-                live_text = ' '.join(seq16) if len(seq16) == 16 else "-"
-                cv2.putText(preview_bgr, live_text, (cx + 12, cy - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-
-                # Robot ID (by rotation-invariant signature)
-                id_text = f"ID:{robot_id_to_draw}" if robot_id_to_draw is not None else "ID:-"
-                cv2.putText(preview_bgr, id_text, (cx + 12, cy + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-
-            # Collect for programmatic use
-            per_frame_output.append({
-                "robot_id": robot_id_to_draw,
-                "track_id": tr.track_id,
-                "center": (cx, cy),
-                "radius": radius,
-                "seq16": seq16[:] if len(seq16) == 16 else []
-            })
-
-        # Optional: print a compact per-frame summary (comment out if too chatty)
-        if per_frame_output:
-            printable = []
-            for d in per_frame_output:
-                if d["robot_id"] is not None and len(d["seq16"]) == 16:
-                    printable.append({
-                        "robot_id": d["robot_id"],
-                        "track_id": d["track_id"],
-                        "center": d["center"],
-                        "seq16": ''.join(d["seq16"])
-                    })
-            if printable:
-                print("robots:", printable)
-
-        # ----- HUD & key handling -----
+        # ---- HUD ----
         if SHOW_PREVIEW:
-            now = time.time()
-            dt = now - last_time
-            last_time = now
-            fps_text = f"FPS~{int(1.0/dt) if dt > 0 else '--'} Rings:{len(tracks)}"
-            cv2.putText(preview_bgr, fps_text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-
-            if hud_best_seq:
-                cv2.putText(preview_bgr, f"Best16 ({hud_best_streak}): {' '.join(hud_best_seq)}",
-                            (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-
-            cv2.imshow("LED Preview", preview_bgr)
+            t=time.time(); dt=t-last_t; last_t=t
+            hud = f"FPS~{int(1.0/dt) if dt>0 else '--'}  robots:{len(tracks)}  r∈[{MIN_RING_RADIUS_PX},{MAX_RING_RADIUS_PX}]px"
+            cv2.putText(vis, hud, (10,22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
+            cv2.imshow("LED Robots", vis)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('f'):
-                prop = cv2.WND_PROP_FULLSCREEN
-                mode = cv2.WINDOW_FULLSCREEN if cv2.getWindowProperty("LED Preview", prop) != cv2.WINDOW_FULLSCREEN else cv2.WINDOW_NORMAL
-                cv2.setWindowProperty("LED Preview", prop, mode)
-            elif key == ord('m'):
-                show_overlays = not show_overlays
-        else:
-            # Even without a window, allow 'q' to bail out if any event loop is active
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if key == ord('q'): break
 
-    # Clean shutdown: release camera and close any OpenCV windows
     cap.release()
     cv2.destroyAllWindows()
 
-# ---------------------- Entry ----------------------
 if __name__ == "__main__":
     main()
