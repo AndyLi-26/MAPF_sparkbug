@@ -1,7 +1,8 @@
-import cv2
+import cv2, time
 import numpy as np
 SATURATION_GAIN=2.5
 SATURATION_CUTOFF=100
+
 RADIUS=110
 def re_sample(img,block_size):
     ori_size=img.shape
@@ -48,13 +49,18 @@ def detect_circles(camera_index=0):
     if not cap.isOpened():
         print(f"Error: Cannot open camera {camera_index}")
         return
-
+    total_frame=0
+    start = time.time()
     while True:
         ret, frame = cap.read()
+
         if not ret:
+            runtime=time.time()-start
+            print(f"fps: {total_frame/runtime}")
             print("Failed to grab frame")
             break
 
+        total_frame+=1
 
         hsv_float = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)#.astype(np.float32)
         hsv_float[:, :, 1] = np.clip(hsv_float[:, :, 1] * SATURATION_GAIN, 0, 255)
@@ -75,7 +81,7 @@ def detect_circles(camera_index=0):
             cv2.HOUGH_GRADIENT,
             dp=1.2,
             minDist=50,
-            param1=40,
+            param1=30,
             param2=70,
             minRadius=40,
             maxRadius=150
