@@ -25,14 +25,6 @@ def fit_bright(frame):
     gray = hsv_float[:,:,1]
     blurred = cv2.GaussianBlur(gray, (5, 5), 2)
 
-    #hsv_float[:, :, 2] = np.clip(hsv_float[:, :, 2] * VALUE_GAIN, 0, 255)
-    #hsv_img = hsv_float.astype(np.uint8)
-    #img_proc = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
-
-    #gray = cv2.cvtColor(img_proc, cv2.COLOR_BGR2GRAY)
-    #gray = re_sample(hsv_float[:,:,1],(8,8)).astype(np.uint8)
-
-
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
@@ -44,15 +36,12 @@ def fit_bright(frame):
         maxRadius=150
     )
     return circles
-
-
 
 def fit_dark(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
     blurred = cv2.GaussianBlur(gray, (5, 5), 2)
 
-
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
@@ -64,8 +53,6 @@ def fit_dark(frame):
         maxRadius=150
     )
     return circles
-
-
 
 def re_sample(img,block_size):
     ori_size=img.shape
@@ -81,14 +68,10 @@ def up_sample(img, new_size):
 def down_sample(img,block_size):
     ori_shape=img.shape
     assert len(ori_shape)==2,"this only down_sample monocolor image"
-    #print("ori shape",ori_shape)
     new_shape=int(ori_shape[0]/block_size[0]),int(ori_shape[1]/block_size[1])
-    #print("new shape",new_shape)
     retval = img.reshape(new_shape[0],block_size[0],new_shape[1],block_size[1])
     temp1=retval.mean(axis=(1,3))
     temp1= np.where(temp1 < SATURATION_CUTOFF, 0, temp1)
-    #print(temp1.max())
-
     #new_img= np.where(new_img < SATURATION_CUTOFF, 0, new_img)
     return temp1 * retval.sum(axis=(1,3))
 
