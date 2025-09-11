@@ -1,5 +1,7 @@
 import cv2, time
 import numpy as np
+LIGHT=True
+MIN_DIST=90
 SATURATION_GAIN=2.5
 SATURATION_CUTOFF=100
 
@@ -29,7 +31,7 @@ def fit_bright(frame):
         blurred,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=50,
+        minDist=MIN_DIST,
         param1=30,
         param2=70,
         minRadius=40,
@@ -46,7 +48,7 @@ def fit_dark(frame):
         blurred,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=50,
+        minDist=MIN_DIST,
         param1=30,
         param2=70,
         minRadius=40,
@@ -88,7 +90,7 @@ def list_cameras(max_tested=10):
 def detect_circles(camera_index=0):
     # Open selected camera
     if camera_index==-1:
-        cap = cv2.VideoCapture("dark.mov")
+        cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
@@ -97,6 +99,9 @@ def detect_circles(camera_index=0):
         return
     total_frame=0
     start = time.time()
+    minx=miny=5000
+    maxx=maxy=1000
+    #with open("circles_bright.csv" if LIGHT else "circles_dark.csv",'w') as f:
     while True:
         ret, frame = cap.read()
 
@@ -109,14 +114,26 @@ def detect_circles(camera_index=0):
         total_frame+=1
 
 
-        circles=fit_dark(frame)
-        #circles=fit_bright(frame)
+        if LIGHT:
+            circles=fit_bright(frame)
+        else:
+            circles=fit_dark(frame)
+
         if circles is not None:
             circles = np.uint16(np.around(circles))
             for (x, y, r) in circles[0, :]:
                 cv2.circle(frame, (x, y), RADIUS, (0, 255, 0), 2)
                 cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
-                print(x,y,r)
+                #print(x,y,r)
+                minx=min(minx,x)
+                maxx=max(maxx,x)
+                miny=min(miny,y)
+                maxy=max(maxy,y)
+                print(f"{total_frame}, ({x},{y})")
+                if total_frame>100:
+                    print(f"({minx},{miny}), ({maxx},{maxy})")
+                    print(f"dif: ({maxx-minx},{maxy-miny})")
+                    exit()
 
         cv2.imshow("Circle Detection", frame)
 
