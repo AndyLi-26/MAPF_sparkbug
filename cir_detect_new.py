@@ -4,6 +4,69 @@ SATURATION_GAIN=2.5
 SATURATION_CUTOFF=100
 
 RADIUS=110
+def imshow_RGB(frame):
+    blue=frame.copy()
+    blue[:,:,1]=0
+    blue[:,:,2]=0
+    cv2.imshow("blue", blue)
+    red=frame.copy()
+    red[:,:,1]=0
+    red[:,:,0]=0
+    cv2.imshow("red", red)
+    green=frame.copy()
+    green[:,:,2]=0
+    green[:,:,0]=0
+    cv2.imshow("green", green)
+
+def fit_bright(frame):
+    hsv_float = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)#.astype(np.float32)
+    hsv_float[:, :, 1] = np.clip(hsv_float[:, :, 1] * SATURATION_GAIN, 0, 255)
+    hsv_float[:, :, 1] = np.where(hsv_float[:,:,1] < SATURATION_CUTOFF, 0, hsv_float[:,:,1])
+    gray = hsv_float[:,:,1]
+    blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+
+    #hsv_float[:, :, 2] = np.clip(hsv_float[:, :, 2] * VALUE_GAIN, 0, 255)
+    #hsv_img = hsv_float.astype(np.uint8)
+    #img_proc = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+
+    #gray = cv2.cvtColor(img_proc, cv2.COLOR_BGR2GRAY)
+    #gray = re_sample(hsv_float[:,:,1],(8,8)).astype(np.uint8)
+
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=50,
+        param1=30,
+        param2=70,
+        minRadius=40,
+        maxRadius=150
+    )
+    return circles
+
+
+
+def fit_dark(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=50,
+        param1=30,
+        param2=70,
+        minRadius=40,
+        maxRadius=150
+    )
+    return circles
+
+
+
 def re_sample(img,block_size):
     ori_size=img.shape
     new_img=down_sample(img,block_size).astype(np.uint8)
@@ -42,7 +105,7 @@ def list_cameras(max_tested=10):
 def detect_circles(camera_index=0):
     # Open selected camera
     if camera_index==-1:
-        cap = cv2.VideoCapture("bright.mov")
+        cap = cv2.VideoCapture("dark.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
@@ -62,31 +125,9 @@ def detect_circles(camera_index=0):
 
         total_frame+=1
 
-        hsv_float = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)#.astype(np.float32)
-        hsv_float[:, :, 1] = np.clip(hsv_float[:, :, 1] * SATURATION_GAIN, 0, 255)
-        hsv_float[:, :, 1] = np.where(hsv_float[:,:,1] < SATURATION_CUTOFF, 0, hsv_float[:,:,1])
-        #hsv_float[:, :, 2] = np.clip(hsv_float[:, :, 2] * VALUE_GAIN, 0, 255)
-        hsv_img = hsv_float.astype(np.uint8)
-        img_proc = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
 
-        gray = cv2.cvtColor(img_proc, cv2.COLOR_BGR2GRAY)
-        #gray = re_sample(hsv_float[:,:,1],(8,8)).astype(np.uint8)
-        gray = hsv_float[:,:,1]
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-
-        cv2.imshow("detecting on", blurred)
-
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=50,
-            param1=30,
-            param2=70,
-            minRadius=40,
-            maxRadius=150
-        )
-
+        circles=fit_dark(frame)
+        #circles=fit_bright(frame)
         if circles is not None:
             circles = np.uint16(np.around(circles))
             for (x, y, r) in circles[0, :]:
