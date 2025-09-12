@@ -1,11 +1,23 @@
-import cv2, time
+import cv2, time, sys
 import numpy as np
-LIGHT=True
-MIN_DIST=90
+LIGHT=int(sys.argv[1])
+RADIUS=55 #50 when in 1080, 100 when in 4k
+MIN_DIST=RADIUS*1.8
 SATURATION_GAIN=2.5
 SATURATION_CUTOFF=100
 
-RADIUS=110
+def imshow_Brightness(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
+    cv2.imshow("bright",gray)
+
+def imshow_Saturation(frame):
+    hsv_float = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)#.astype(np.float32)
+    hsv_float[:, :, 1] = np.clip(hsv_float[:, :, 1] * SATURATION_GAIN, 0, 255)
+    hsv_float[:, :, 1] = np.where(hsv_float[:,:,1] < SATURATION_CUTOFF, 0, hsv_float[:,:,1])
+    gray = hsv_float[:,:,1]
+    cv2.imshow("bright",gray)
+
 def imshow_RGB(frame):
     blue=frame.copy()
     blue[:,:,1]=0
@@ -26,6 +38,7 @@ def fit_bright(frame):
     hsv_float[:, :, 1] = np.where(hsv_float[:,:,1] < SATURATION_CUTOFF, 0, hsv_float[:,:,1])
     gray = hsv_float[:,:,1]
     blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+    cv2.imshow("saturation",blurred)
 
     circles = cv2.HoughCircles(
         blurred,
@@ -34,7 +47,7 @@ def fit_bright(frame):
         minDist=MIN_DIST,
         param1=30,
         param2=70,
-        minRadius=40,
+        minRadius=10,
         maxRadius=150
     )
     return circles
@@ -43,15 +56,16 @@ def fit_dark(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
     blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+    cv2.imshow("bright",blurred)
 
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
         minDist=MIN_DIST,
-        param1=30,
-        param2=70,
-        minRadius=40,
+        param1=10,
+        param2=35,
+        minRadius=8,
         maxRadius=150
     )
     return circles
@@ -113,7 +127,7 @@ def detect_circles(camera_index=0):
 
         total_frame+=1
 
-
+        print("frame size: ",frame.shape)
         if LIGHT:
             circles=fit_bright(frame)
         else:
@@ -130,10 +144,6 @@ def detect_circles(camera_index=0):
                 miny=min(miny,y)
                 maxy=max(maxy,y)
                 print(f"{total_frame}, ({x},{y})")
-                if total_frame>100:
-                    print(f"({minx},{miny}), ({maxx},{maxy})")
-                    print(f"dif: ({maxx-minx},{maxy-miny})")
-                    exit()
 
         cv2.imshow("Circle Detection", frame)
 
@@ -144,7 +154,6 @@ def detect_circles(camera_index=0):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    '''
     cams = list_cameras()
     if not cams:
         print("No cameras found!")
@@ -154,5 +163,4 @@ if __name__ == "__main__":
         print(f"  {idx}")
     choice = int(input("Select camera index: "))
     detect_circles(choice)
-    '''
-    detect_circles(-1)
+    #detect_circles(-1)
