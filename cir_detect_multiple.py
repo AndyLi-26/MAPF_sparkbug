@@ -1,7 +1,9 @@
 import cv2, time, sys
 import numpy as np
+LOG=False
+SHOW=True
 LIGHT=int(sys.argv[1])
-RADIUS=55 #50 when in 1080, 100 when in 4k
+RADIUS=60 #60 when in 1080, 100 when in 4k
 MIN_DIST=RADIUS*1.8
 SATURATION_GAIN=2.5
 SATURATION_CUTOFF=130
@@ -13,28 +15,31 @@ new_circles=[]
 
 def update_circles(frame):
     for i,c in enumerate(circles):
-        print("original pos: ",c)
+        if LOG:
+            print("original pos: ",c)
         (x1,x2,y1,y2)=crop(c,frame)
-        print("cropped cornner",x1,x2,y1,y2)
+        if LOG:
+            print("cropped cornner",x1,x2,y1,y2)
         cropped_frame=frame[x1:x2,y1:y2]
-        #print(f"frame size of cropped image: {cropped_frame.shape}")
         retval=fit_circle(cropped_frame)
 
         if retval is None:
-            print("no circle detected")
+            if LOG:
+                print("no circle detected")
         else:
-            print(f"got {len(retval)} circle detected")
             retval = np.uint16(np.around(retval))
-            print("from detection",retval)
+            if LOG:
+                print(f"got {len(retval)} circle detected")
+                print("from detection",retval)
             x,y,_=retval[0][0]
             circles[i]=(x+y1,y+x1)
 
-        if retval is not None:
-            for (x, y, r) in retval[0, :]:
-                print(x,y)
-                cv2.circle(cropped_frame, (x, y), RADIUS, (255, 255, 0), 2)
-                cv2.circle(cropped_frame, (x, y), 2, (0, 0, 255), 3)
-        cv2.imshow(f"circle{i}",cropped_frame)
+        if SHOW:
+            if retval is not None:
+                for (x, y, r) in retval[0, :]:
+                    cv2.circle(cropped_frame, (x, y), RADIUS, (255, 255, 0), 2)
+                    cv2.circle(cropped_frame, (x, y), 2, (0, 0, 255), 3)
+            cv2.imshow(f"circle{i}",cropped_frame)
 
 def fit_circle(frame):
     if LIGHT:
@@ -61,21 +66,22 @@ def click_event(event, x, y, flags, param):
         clicked_coords = (x, y)
         circles.append((x,y))
         imshow()
-        print("Clicked:", clicked_coords)
+        if LOG:
+            print("Clicked:", clicked_coords)
 
 def imshow():
     global circles,new_circles,frame
     for x,y in new_circles:
-        print(x,y)
+        if LOG:
+            print(x,y)
         cv2.circle(frame, (x, y), RADIUS, (255, 255, 0), 2)
         cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
     for x,y in circles:
-        print(x,y)
+        if LOG:
+            print(x,y)
         cv2.circle(frame, (x, y), RADIUS, (0, 255, 0), 2)
         cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
     cv2.imshow("Circle Detection", frame)
-
-
 
 def imshow_Brightness(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -127,7 +133,8 @@ def fit_dark(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
     blurred = cv2.GaussianBlur(gray, (7, 7), 2)
-    cv2.imshow("bright",blurred)
+    if SHOW:
+        cv2.imshow("bright",blurred)
 
     circles = cv2.HoughCircles(
         blurred,
@@ -184,7 +191,7 @@ def detect_circles(camera_index=0):
         print(f"Error: Cannot open camera {camera_index}")
         return
     total_frame=0
-    start = time.time()
+    start=0
     minx=miny=5000
     maxx=maxy=1000
     #with open("circles_bright.csv" if LIGHT else "circles_dark.csv",'w') as f:
@@ -197,18 +204,22 @@ def detect_circles(camera_index=0):
             break
 
         ori_frame=frame.copy()
-        print("----------------------------------------------------")
-        print("frame size: ",frame.shape)
+        if LOG:
+            print("----------------------------------------------------")
         total_frame+=1
         if not setup:
+            if LOG:
+                print("frame size: ",frame.shape)
             temp=fit_circle(frame)
             if temp is None:
-                print("no init circle")
+                if LOG:
+                    print("no init circle")
             if temp is not None:
                 temp = np.uint16(np.around(temp))
                 for (x, y, r) in temp[0, :]:
                     new_circles.append((x,y))
-                    print("detected circle pos:",x,y)
+                    if LOG:
+                        print("detected circle pos:",x,y)
                     cv2.circle(frame, (x, y), RADIUS, (255, 255, 0), 2)
                     cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
             cv2.imshow("Circle Detection", frame)
@@ -217,13 +228,19 @@ def detect_circles(camera_index=0):
             key= cv2.waitKey(0) & 0xFF
             if key == 13:   # Enter key ASCII code
                 setup=True
+                start = time.time()
                 new_circles=[]
-                print("Enter")
+                if LOG:
+                    print("Enter")
 
         else:
-            print(f"{total_frame}:{circles}")
+            if LOG:
+                print(f"{total_frame}:{circles}")
             update_circles(frame)
 
+
+        if SHOW:
+            imshow()
         imshow()
 
         key= cv2.waitKey(1) & 0xFF
