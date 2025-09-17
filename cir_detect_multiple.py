@@ -3,7 +3,7 @@ import numpy as np
 LOG=False
 SHOW=True
 LIGHT=int(sys.argv[1])
-RADIUS=60 #60 when in 1080, 100 when in 4k
+RADIUS=55 #60 when in 1080, 100 when in 4k
 MIN_DIST=RADIUS*1.8
 SATURATION_GAIN=2.5
 SATURATION_CUTOFF=130
