@@ -1,4 +1,4 @@
-import cv2, time, sys, math
+import cv2, time, sys, math, csv, os
 import numpy as np
 from collections import deque
 import database
@@ -52,6 +52,60 @@ pose_hist      = {}           # {idx: deque([angles])}
 last_centers   = {}           # {idx: (x,y)}
 
 LABEL2I = {'C':0,'M':1,'Y':2,'G':3}
+
+# =================== CSV LOGGING ===================
+LOG_CSV  = False                     # <-- toggle logging here
+CSV_PATH = "robot_frames_log.csv"   # output file
+_csv_f   = None
+_csv_w   = None
+
+def csv_init(path):
+    """Open CSV and write header."""
+    global _csv_f, _csv_w
+    if not LOG_CSV: return
+    # ensure folder exists
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    _csv_f = open(path, "w", newline="")
+    _csv_w = csv.writer(_csv_f)
+    _csv_w.writerow([
+        "frame", "circle_idx", "x", "y",
+        "id_stable", "id_frame", "score16", "shift",
+        "front_idx", "verified",
+        "angle_raw_deg", "angle_smooth_deg",
+        "front_v", "front_hue",
+        "labels_string"
+    ])
+
+def csv_log_rows(rows):
+    """Append rows to CSV."""
+    if not LOG_CSV or _csv_w is None: return
+    for r in rows:
+        _csv_w.writerow([
+            r.get("frame"),
+            r.get("circle_idx"),
+            r.get("x"),
+            r.get("y"),
+            r.get("id_stable"),
+            r.get("id_frame"),
+            r.get("score16"),
+            r.get("shift"),
+            r.get("front_idx"),
+            r.get("verified"),
+            r.get("angle_raw_deg"),
+            r.get("angle_smooth_deg"),
+            r.get("front_v"),
+            r.get("front_hue"),
+            r.get("labels_string")
+        ])
+
+def csv_close():
+    """Close CSV cleanly."""
+    global _csv_f, _csv_w
+    if _csv_f:
+        _csv_f.flush()
+        _csv_f.close()
+    _csv_f = None
+    _csv_w = None
 
 # ================================================================
 # =================== CORE GEOM / ANGLES =========================
@@ -233,7 +287,6 @@ def best_match(labels, sequences):
     return best_id, best_sc, best_sh
 
 def front_from_shift(shift, n): return (-shift) % n
-
 def _wrap(i, n): return (i % n + n) % n
 
 def neighbor_score(obs, canon, idx, win=2):
@@ -335,8 +388,11 @@ def draw_main():
 
 # ================================================================
 # =================== PER-FRAME UPDATE ===========================
-def update():
+def update(frame_idx):
+    """Process all circles, return list of per-circle dicts for logging."""
     global pose_raw_deg, pose_smooth, last_centers
+    rows = []
+
     for i, c in enumerate(circles):
         y1, y2, x1, x2 = crop_bounds(c, frame)
         if (y2 - y1) <= 1 or (x2 - x1) <= 1:
@@ -355,8 +411,8 @@ def update():
             x, y, _ = det[0][0]
             local_center = (int(x), int(y))
             gx, gy = int(x) + x1, int(y) + y1
-            circles[i]     = (gx, gy)
-            last_centers[i]= (gx, gy)
+            circles[i]      = (gx, gy)
+            last_centers[i] = (gx, gy)
         else:
             if i in last_centers:
                 gx, gy = last_centers[i]
@@ -371,8 +427,21 @@ def update():
             except Exception as e:
                 if DEBUG: print("LED ring error:", e)
 
+        # Defaults for logging in case we can't compute this frame
+        row = {
+            "frame": frame_idx, "circle_idx": i,
+            "x": gx if gx is not None else "",
+            "y": gy if gy is not None else "",
+            "id_stable": "", "id_frame": "", "score16": "", "shift": "",
+            "front_idx": "", "verified": "",
+            "angle_raw_deg": pose_raw_deg.get(i, ""),
+            "angle_smooth_deg": pose_smooth.get(i, ""),
+            "front_v": "", "front_hue": "", "labels_string": ""
+        }
+
         if led is not None:
             labels = [p['label'] for p in led]
+            row["labels_string"] = ''.join(labels)
             try:
                 rid, sc, sh = best_match(labels, database.SEQUENCES)
 
@@ -390,14 +459,34 @@ def update():
                     if sm is not None:
                         pose_smooth[i] = sm
 
-                raw_s  = f"{pose_raw_deg.get(i):6.1f}°" if i in pose_raw_deg else "  --.-°"
-                smt_s  = f"{pose_smooth.get(i):6.1f}°" if i in pose_smooth else "  --.-°"
-                gx_s   = "None" if gx is None else str(int(gx))
-                gy_s   = "None" if gy is None else str(int(gy))
+                # Terminal status (unchanged)
+                gx_s = "None" if gx is None else str(int(gx))
+                gy_s = "None" if gy is None else str(int(gy))
                 print(f"[circle {i}] ID(stable)={stable_id+1:02d}  x={gx_s} y={gy_s}  "
                       f"(frame id={rid+1:02d}, score={sc}/16, shift={sh})")
+
+                # Populate row for CSV
+                row.update({
+                    "id_stable": stable_id + 1,
+                    "id_frame": rid + 1,
+                    "score16": sc,
+                    "shift": sh,
+                    "front_idx": front_idx if front_idx is not None else "",
+                    "verified": int(bool(ok)),
+                    "angle_raw_deg": pose_raw_deg.get(i, ""),
+                    "angle_smooth_deg": pose_smooth.get(i, "")
+                })
+
+                if front_idx is not None:
+                    row["front_v"]   = led[front_idx]['v']
+                    row["front_hue"] = led[front_idx]['hue']
+
             except Exception as e:
                 print("Robot ID/pose error:", e)
+
+        rows.append(row)
+
+    return rows
 
 # ================================================================
 # =================== CAMERA / MAIN LOOP =========================
@@ -412,15 +501,17 @@ def list_cameras(max_tested=10):
 
 def run(camera_index=0):
     global frame, setup, new_circles, paused, POSE_WIN
+    csv_init(CSV_PATH)
 
     if camera_index == -1:
-        # cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_mult_2.mov")
-        cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_multiple.mov")
+        cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_mult_2.mov")
+        # cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_multiple.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
     if not cap.isOpened():
         print(f"Error: Cannot open camera {camera_index}")
+        csv_close()
         return
 
     print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
@@ -472,7 +563,11 @@ def run(camera_index=0):
                     print("Failed to grab frame"); break
                 total += 1
 
-            update()
+            # ==== process + CSV log ====
+            rows = update(total)
+            if LOG_CSV and rows:
+                csv_log_rows(rows)
+
             if SHOW: draw_main()
 
             key = cv2.waitKey(1) & 0xFF
@@ -490,6 +585,7 @@ def run(camera_index=0):
 
     cap.release()
     cv2.destroyAllWindows()
+    csv_close()
 
 # ================================================================
 # =================== ENTRY =====================================
