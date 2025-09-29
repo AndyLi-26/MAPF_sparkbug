@@ -59,11 +59,15 @@ def update_circles(frame):
 
         if SHOW:
             vis = cropped_frame.copy()
+            hsv = cv2.cvtColor(vis, cv2.COLOR_BGR2HSV)
+            hue = hsv[:, :, 0]
+
+            hue_color = cv2.applyColorMap(cv2.convertScaleAbs(hue, alpha=255/179.0), cv2.COLORMAP_HSV)
             if retval is not None:
                 for (x, y, r) in retval[0, :]:
                     cv2.circle(vis, (int(x), int(y)), int(RADIUS), (255, 255, 0), 2)
                     cv2.circle(vis, (int(x), int(y)), 2, (0, 0, 255), 3)
-            cv2.imshow(f"circle{i}", vis)
+            cv2.imshow(f"circle{i}", hue_color)
 
 def fit_circle(frame):
     if LIGHT:
@@ -137,6 +141,21 @@ def imshow_Brightness(frame):
     gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
     cv2.imshow("bright",gray)
 
+def imshow_Hue(frame):
+    """
+    Show the hue channel (0-179 in OpenCV).
+    Useful for debugging LED color detection.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+
+    # Optional: apply a colormap so you can see hue variations better
+    hue_color = cv2.applyColorMap(cv2.convertScaleAbs(hue, alpha=255/179.0), cv2.COLORMAP_HSV)
+
+    # cv2.imshow("hue_raw", hue)        # grayscale hue channel
+    cv2.imshow("hue_colored", hue_color)  # colored version for easier visualization
+
+
 def imshow_Saturation(frame):
     hsv_float = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)#.astype(np.float32)
     hsv_float[:, :, 1] = np.clip(hsv_float[:, :, 1] * SATURATION_GAIN, 0, 255)
@@ -186,8 +205,10 @@ def fit_dark(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = np.where(gray < SATURATION_CUTOFF, 0, gray)
     blurred = cv2.GaussianBlur(gray, (7, 7), 2)
+    
     if SHOW:
         cv2.imshow("bright", blurred)
+        
 
     circles = cv2.HoughCircles(
         blurred,
@@ -298,6 +319,7 @@ def detect_circles(camera_index=0):
 
         if SHOW:
             imshow()
+            imshow_Hue(frame) 
 
         key = cv2.waitKey(1) & 0xFF
         if key == 8:  # Backspace
