@@ -3,6 +3,7 @@ import numpy as np
 from collections import deque
 import database
 
+
 # =================== GLOBAL SETTINGS ===================
 DEBUG = False
 SHOW  = True
@@ -10,8 +11,10 @@ LIGHT = False                 # set True if using saturation-based circle fit
 R     = 45                    # ring radius in px (≈60 @ 1080p, ≈100 @ 4k)
 MIN_DIST = R * 1.8
 
+
 SAT_GAIN   = 2.5
 SAT_CUTOFF = 130
+
 
 # =================== LED RING CONFIG ===================
 N_LEDS        = 16
@@ -24,6 +27,7 @@ MIN_V         = 100
 TINY_REFINE_R = 2
 TH_STEP_DEG   = 2.0
 
+
 # Hue bands (OpenCV hue 0..179)
 HUE_BANDS = {
     'Y': [(0, 50), (145, 180)],
@@ -32,6 +36,7 @@ HUE_BANDS = {
     'M': [(115, 140)],
 }
 
+
 # =================== SMOOTHING (runtime [ / ]) ===================
 paused        = False
 POSE_WIN      = 20
@@ -39,6 +44,40 @@ POSE_KEEP_FR  = 0.6
 POSE_MIN_KEEP = 3
 POSE_WIN_MAX  = 50
 POSE_WIN_MIN  = 3
+
+
+# =================== TRAJECTORY SETTINGS ===================
+TRAJECTORY_ENABLED = False
+SHOW_TRAJECTORY_CANVAS = False  # <-- Toggle separate trajectory window
+TRAJECTORY_MAX_ALPHA = 0.8    # max opacity for newest point
+TRAJECTORY_MIN_ALPHA = 0.1    # min opacity for oldest point
+TRAJECTORY_LINE_THICKNESS = 2
+TRAJECTORY_FADE_POWER = 1.5   # exponential fade (higher = faster fade)
+
+# Distinctive color palette for up to 20 robots (BGR format)
+ROBOT_COLORS = [
+    (255, 0, 0),      # Blue
+    (0, 255, 0),      # Green
+    (0, 0, 255),      # Red
+    (255, 255, 0),    # Cyan
+    (255, 0, 255),    # Magenta
+    (0, 255, 255),    # Yellow
+    (255, 128, 0),    # Light Blue
+    (128, 0, 255),    # Pink
+    (0, 255, 128),    # Spring Green
+    (255, 0, 128),    # Purple-ish
+    (128, 255, 0),    # Lime
+    (0, 128, 255),    # Orange
+    (128, 255, 255),  # Light Yellow
+    (255, 128, 255),  # Light Magenta
+    (255, 255, 128),  # Light Cyan
+    (200, 100, 50),   # Dark Blue
+    (50, 200, 100),   # Teal
+    (100, 50, 200),   # Purple
+    (200, 200, 50),   # Olive
+    (50, 100, 200),   # Brown-ish
+]
+
 
 # =================== RUNTIME STATE ===================
 setup          = False
@@ -50,14 +89,19 @@ pose_raw_deg   = {}           # {idx: last raw pose}
 pose_smooth    = {}           # {idx: last smoothed pose}
 pose_hist      = {}           # {idx: deque([angles])}
 last_centers   = {}           # {idx: (x,y)}
+trajectories   = {}           # {idx: [(x, y, frame_num), ...]}
+stable_ids     = {}           # {idx: stable_robot_id}
+
 
 LABEL2I = {'C':0,'M':1,'Y':2,'G':3}
+
 
 # =================== CSV LOGGING ===================
 LOG_CSV  = False                     # <-- toggle logging here
 CSV_PATH = "robot_frames_log.csv"   # output file
 _csv_f   = None
 _csv_w   = None
+
 
 def csv_init(path):
     """Open CSV and write header."""
@@ -75,6 +119,7 @@ def csv_init(path):
         "front_v", "front_hue",
         "labels_string"
     ])
+
 
 def csv_log_rows(rows):
     """Append rows to CSV."""
@@ -98,6 +143,7 @@ def csv_log_rows(rows):
             r.get("labels_string")
         ])
 
+
 def csv_close():
     """Close CSV cleanly."""
     global _csv_f, _csv_w
@@ -107,14 +153,207 @@ def csv_close():
     _csv_f = None
     _csv_w = None
 
+
+# ================================================================
+# =================== TRAJECTORY FUNCTIONS =======================
+def get_robot_color(idx):
+    """Get consistent color for a robot based on its index."""
+    return ROBOT_COLORS[idx % len(ROBOT_COLORS)]
+
+
+def add_trajectory_point(idx, x, y, frame_num):
+    """Add a point to robot's trajectory."""
+    if idx not in trajectories:
+        trajectories[idx] = []
+    trajectories[idx].append((int(x), int(y), frame_num))
+
+
+def draw_trajectories(img, current_frame):
+    """Draw all trajectories with fading effect on the main image."""
+    if not TRAJECTORY_ENABLED:
+        return
+    
+    for idx, traj in trajectories.items():
+        if len(traj) < 2:
+            continue
+        
+        color = get_robot_color(idx)
+        n_points = len(traj)
+        
+        # Draw line segments with fading
+        for i in range(len(traj) - 1):
+            x1, y1, _ = traj[i]
+            x2, y2, _ = traj[i + 1]
+            
+            # Calculate alpha based on position in trajectory (exponential fade)
+            progress = (i + 1) / n_points
+            alpha = TRAJECTORY_MIN_ALPHA + (TRAJECTORY_MAX_ALPHA - TRAJECTORY_MIN_ALPHA) * (progress ** TRAJECTORY_FADE_POWER)
+            
+            # Create overlay for transparency
+            overlay = img.copy()
+            cv2.line(overlay, (x1, y1), (x2, y2), color, TRAJECTORY_LINE_THICKNESS, cv2.LINE_AA)
+            cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+
+def draw_legend(img):
+    """Draw legend showing robot ID to color mapping."""
+    if not stable_ids:
+        return
+    
+    # Legend settings
+    legend_x = 10
+    legend_y = 30
+    line_height = 30
+    circle_radius = 8
+    text_offset_x = 25
+    
+    # Semi-transparent background
+    max_robots = len(stable_ids)
+    bg_height = max_robots * line_height + 20
+    bg_width = 150
+    overlay = img.copy()
+    cv2.rectangle(overlay, (5, 5), (5 + bg_width, 5 + bg_height), (50, 50, 50), -1)
+    cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+    
+    # Draw each robot entry
+    for i, (idx, robot_id) in enumerate(sorted(stable_ids.items())):
+        y_pos = legend_y + i * line_height
+        color = get_robot_color(idx)
+        
+        # Draw colored circle
+        cv2.circle(img, (legend_x + circle_radius, y_pos), circle_radius, color, -1)
+        cv2.circle(img, (legend_x + circle_radius, y_pos), circle_radius, (255, 255, 255), 1)
+        
+        # Draw robot ID text
+        cv2.putText(img, f"Robot {robot_id + 1:02d}", 
+                    (legend_x + text_offset_x, y_pos + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def create_trajectory_canvas(width, height):
+    """Create a separate canvas for trajectory visualization."""
+    canvas = np.ones((height, width, 3), dtype=np.uint8) * 240  # Light gray background
+    return canvas
+
+
+def draw_trajectory_canvas(width, height, current_frame):
+    """Draw trajectory canvas with robot icons and paths."""
+    canvas = create_trajectory_canvas(width, height)
+    
+    # Draw grid (optional)
+    grid_color = (220, 220, 220)
+    grid_spacing = 50
+    for x in range(0, width, grid_spacing):
+        cv2.line(canvas, (x, 0), (x, height), grid_color, 1)
+    for y in range(0, height, grid_spacing):
+        cv2.line(canvas, (0, y), (width, y), grid_color, 1)
+    
+    # Draw all trajectories
+    for idx, traj in trajectories.items():
+        if len(traj) < 2:
+            continue
+        
+        color = get_robot_color(idx)
+        n_points = len(traj)
+        
+        # Draw path with fading
+        for i in range(len(traj) - 1):
+            x1, y1, _ = traj[i]
+            x2, y2, _ = traj[i + 1]
+            
+            # Fading effect
+            progress = (i + 1) / n_points
+            alpha = TRAJECTORY_MIN_ALPHA + (TRAJECTORY_MAX_ALPHA - TRAJECTORY_MIN_ALPHA) * (progress ** TRAJECTORY_FADE_POWER)
+            
+            overlay = canvas.copy()
+            cv2.line(overlay, (x1, y1), (x2, y2), color, TRAJECTORY_LINE_THICKNESS, cv2.LINE_AA)
+            cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+        
+        # Draw robot icon at current position (last point)
+        if traj:
+            x, y, _ = traj[-1]
+            robot_radius = 12
+            
+            # Draw robot body (circle)
+            cv2.circle(canvas, (x, y), robot_radius, color, -1)
+            cv2.circle(canvas, (x, y), robot_radius, (0, 0, 0), 2)
+            
+            # Draw orientation arrow
+            if idx in pose_smooth or idx in pose_raw_deg:
+                angle = pose_smooth.get(idx, pose_raw_deg.get(idx))
+                if angle is not None:
+                    arrow_len = int(robot_radius * 1.5)
+                    dx = int(arrow_len * math.cos(math.radians(angle)))
+                    dy = int(arrow_len * math.sin(math.radians(angle)))
+                    arrow_end = (x + dx, y + dy)
+                    cv2.arrowedLine(canvas, (x, y), arrow_end, (0, 0, 0), 2, tipLength=0.3)
+            
+            # Draw robot ID
+            robot_id = stable_ids.get(idx, -1)
+            if robot_id >= 0:
+                cv2.putText(canvas, f"{robot_id + 1}", 
+                           (x - 8, y + 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Draw legend on trajectory canvas
+    draw_legend_trajectory_canvas(canvas)
+    
+    return canvas
+
+
+def draw_legend_trajectory_canvas(canvas):
+    """Draw legend on trajectory canvas."""
+    if not stable_ids:
+        return
+    
+    # Legend at top-right
+    canvas_height, canvas_width = canvas.shape[:2]
+    legend_width = 150
+    legend_x = canvas_width - legend_width - 10
+    legend_y = 30
+    line_height = 30
+    circle_radius = 8
+    text_offset_x = 25
+    
+    # Semi-transparent background
+    max_robots = len(stable_ids)
+    bg_height = max_robots * line_height + 20
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (legend_x - 5, 5), 
+                  (legend_x + legend_width, 5 + bg_height), 
+                  (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.8, canvas, 0.2, 0, canvas)
+    
+    # Draw border
+    cv2.rectangle(canvas, (legend_x - 5, 5), 
+                  (legend_x + legend_width, 5 + bg_height), 
+                  (100, 100, 100), 2)
+    
+    # Draw each robot entry
+    for i, (idx, robot_id) in enumerate(sorted(stable_ids.items())):
+        y_pos = legend_y + i * line_height
+        color = get_robot_color(idx)
+        
+        # Draw colored circle
+        cv2.circle(canvas, (legend_x + circle_radius, y_pos), circle_radius, color, -1)
+        cv2.circle(canvas, (legend_x + circle_radius, y_pos), circle_radius, (0, 0, 0), 1)
+        
+        # Draw robot ID text
+        cv2.putText(canvas, f"Robot {robot_id + 1:02d}", 
+                    (legend_x + text_offset_x, y_pos + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+
 # ================================================================
 # =================== CORE GEOM / ANGLES =========================
 def ang_norm(a):
     a %= 360.0
     return a + 360.0 if a < 0 else a
 
+
 def ang_diff(a, b):
     return (a - b + 180.0) % 360.0 - 180.0
+
 
 def circ_mean_deg(angles):
     if not angles: return None
@@ -124,9 +363,11 @@ def circ_mean_deg(angles):
         return ang_norm(angles[-1])
     return ang_norm(math.degrees(math.atan2(s, c)))
 
+
 def angle_of(cx, cy, x, y):
     a = math.degrees(math.atan2(y - cy, x - cx))
     return a + 360.0 if a < 0 else a
+
 
 # ================================================================
 # =================== CIRCLE FINDING =============================
@@ -134,6 +375,7 @@ def fit_circle(img):
     if img is None or img.size == 0:
         return None
     return fit_bright(img) if LIGHT else fit_dark(img)
+
 
 def fit_bright(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -147,6 +389,7 @@ def fit_bright(img):
         param1=30, param2=60, minRadius=10, maxRadius=150
     )
 
+
 def fit_dark(img):
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     g = np.where(g < SAT_CUTOFF, 0, g)
@@ -155,6 +398,7 @@ def fit_dark(img):
         blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=MIN_DIST,
         param1=10, param2=25, minRadius=8, maxRadius=150
     )
+
 
 def crop_bounds(center, img):
     cx, cy = int(center[0]), int(center[1])
@@ -165,6 +409,7 @@ def crop_bounds(center, img):
     if x2 < x1: x1, x2 = x2, x1
     if y2 < y1: y1, y2 = y2, y1
     return y1, y2, x1, x2
+
 
 # ================================================================
 # =================== LED SAMPLING / CLASSIFY ====================
@@ -188,6 +433,7 @@ def sample_v_stat(V, x0, y0, r, stat='median'):
     elif stat == 'max':    return float(np.max(arr))
     else:                  return float(np.mean(arr))
 
+
 def find_bright_theta(V, cx, cy, r_mid, step_deg):
     best_t, best_v = None, -1.0
     for t in np.arange(0.0, 360.0, step_deg):
@@ -196,6 +442,7 @@ def find_bright_theta(V, cx, cy, r_mid, step_deg):
         v = sample_v_stat(V, x, y, BLOB_R, stat='median')
         if v > best_v: best_v, best_t = v, t
     return best_t if best_t is not None else (THETA0_DEG % 360.0)
+
 
 def refine_local_max(V, x0, y0, r, bounds_wh):
     w, h = bounds_wh
@@ -218,6 +465,7 @@ def refine_local_max(V, x0, y0, r, bounds_wh):
             best_v, best_xy = v, (x, y)
     return best_xy[0], best_xy[1], best_v
 
+
 def hue_median(H, V, x0, y0, r, v_min):
     h, w = H.shape
     y_min, y_max = max(0, y0 - r), min(h - 1, y0 + r)
@@ -235,6 +483,7 @@ def hue_median(H, V, x0, y0, r, v_min):
     if not vals: return -1
     return float(np.median(np.asarray(vals, dtype=np.float32)))
 
+
 def classify_hue(h):
     if h < 0: return 'C'
     for lab, ranges in HUE_BANDS.items():
@@ -246,6 +495,7 @@ def classify_hue(h):
         d = min(abs(h - c), 180 - abs(h - c))
         if d < best_d: best_d, best_lab = d, lab
     return best_lab or 'C'
+
 
 def analyze_ring(crop_bgr, center_xy, approx_r):
     cx, cy = map(int, center_xy)
@@ -270,10 +520,12 @@ def analyze_ring(crop_bgr, center_xy, approx_r):
         out.append({'pt':(nx,ny), 'refined':(rx,ry), 'label':lab, 'hue':hmed, 'v':vpk})
     return out
 
+
 # ================================================================
 # =================== ROTATION-AWARE ID & POSE ====================
 def rot(seq, k): k %= len(seq); return seq[k:] + seq[:k]
 def score(a, b): return sum(1 for x, y in zip(a, b) if x == y)
+
 
 def best_match(labels, sequences):
     obs = [LABEL2I.get(ch, 0) for ch in labels]
@@ -286,8 +538,10 @@ def best_match(labels, sequences):
             if sc > best_sc: best_id, best_sc, best_sh = sid, sc, sh
     return best_id, best_sc, best_sh
 
+
 def front_from_shift(shift, n): return (-shift) % n
 def _wrap(i, n): return (i % n + n) % n
+
 
 def neighbor_score(obs, canon, idx, win=2):
     n, s = len(obs), 0
@@ -296,6 +550,7 @@ def neighbor_score(obs, canon, idx, win=2):
             s += 1
     return s
 
+
 def best_front_index(labels, canon, win=2):
     obs = [LABEL2I.get(ch, 0) for ch in labels]
     best_i, best_s = 0, -1
@@ -303,6 +558,7 @@ def best_front_index(labels, canon, win=2):
         s = neighbor_score(obs, canon, j, win)
         if s > best_s: best_i, best_s = j, s
     return best_i, best_s
+
 
 def compute_pose(led_info, labels, rid, shift, center_xy, verify=True, min_ok=3):
     if rid is None or rid < 0 or (led_info is None) or len(led_info) != N_LEDS:
@@ -324,6 +580,7 @@ def compute_pose(led_info, labels, rid, shift, center_xy, verify=True, min_ok=3)
     pose   = angle_of(cx, cy, rx, ry)
     return pose, front, ok
 
+
 # ================================================================
 # =================== POSE STABILIZATION =========================
 def pose_push(i, pose_deg):
@@ -335,6 +592,7 @@ def pose_push(i, pose_deg):
         dq = pose_hist[i]
     dq.append(pose_deg)
 
+
 def pose_get(i):
     if i not in pose_hist or len(pose_hist[i]) == 0: return None
     arr    = list(pose_hist[i])
@@ -342,6 +600,7 @@ def pose_get(i):
     arr.sort(key=lambda a: abs(ang_diff(a, latest)))
     k = max(1, min(len(arr), max(POSE_MIN_KEEP, int(math.ceil(POSE_KEEP_FR * len(arr))))))
     return circ_mean_deg(arr[:k])
+
 
 # ================================================================
 # =================== UI: CLICKS & OVERLAY =======================
@@ -352,6 +611,7 @@ def on_click(event, x, y, *_):
         circles.append((int(x), int(y)))
         draw_main()
         if DEBUG: print("Clicked:", (x, y))
+
 
 def draw_main():
     if frame is None or frame.size == 0: return
@@ -384,13 +644,20 @@ def draw_main():
             cv2.putText(vis, f"{ang:5.1f} deg", (p1[0] + 8, p1[1]),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
 
+    # Draw trajectories with fading
+    draw_trajectories(vis, 0)  # frame number not used currently
+    
+    # Draw legend
+    draw_legend(vis)
+
     cv2.imshow("Circle Detection", vis)
+
 
 # ================================================================
 # =================== PER-FRAME UPDATE ===========================
 def update(frame_idx):
     """Process all circles, return list of per-circle dicts for logging."""
-    global pose_raw_deg, pose_smooth, last_centers
+    global pose_raw_deg, pose_smooth, last_centers, stable_ids
     rows = []
 
     for i, c in enumerate(circles):
@@ -413,9 +680,13 @@ def update(frame_idx):
             gx, gy = int(x) + x1, int(y) + y1
             circles[i]      = (gx, gy)
             last_centers[i] = (gx, gy)
+            
+            # Add to trajectory
+            add_trajectory_point(i, gx, gy, frame_idx)
         else:
             if i in last_centers:
                 gx, gy = last_centers[i]
+                add_trajectory_point(i, gx, gy, frame_idx)
 
         led = None
         if local_center is not None:
@@ -448,6 +719,7 @@ def update(frame_idx):
                 if i not in id_counts: id_counts[i] = {}
                 id_counts[i][rid] = id_counts[i].get(rid, 0) + 1
                 stable_id = max(id_counts[i], key=id_counts[i].get)
+                stable_ids[i] = stable_id  # Store for legend
 
                 pose_deg, front_idx, ok = compute_pose(
                     led, labels, rid, sh, local_center, verify=True, min_ok=3
@@ -488,6 +760,7 @@ def update(frame_idx):
 
     return rows
 
+
 # ================================================================
 # =================== CAMERA / MAIN LOOP =========================
 def list_cameras(max_tested=10):
@@ -499,13 +772,13 @@ def list_cameras(max_tested=10):
             cap.release()
     return found
 
+
 def run(camera_index=0):
-    global frame, setup, new_circles, paused, POSE_WIN
+    global frame, setup, new_circles, paused, POSE_WIN, SHOW_TRAJECTORY_CANVAS
     csv_init(CSV_PATH)
 
     if camera_index == -1:
         cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_mult_2.mov")
-        # cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_multiple.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
@@ -514,7 +787,13 @@ def run(camera_index=0):
         csv_close()
         return
 
+    # Get video dimensions for trajectory canvas
+    video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
     print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
+    print(f"[trajectory] Enabled with fading (alpha: {TRAJECTORY_MIN_ALPHA}-{TRAJECTORY_MAX_ALPHA})")
+    print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'} (toggle with 'c' key)")
 
     total, t0 = 0, 0
     while True:
@@ -568,7 +847,19 @@ def run(camera_index=0):
             if LOG_CSV and rows:
                 csv_log_rows(rows)
 
-            if SHOW: draw_main()
+            if SHOW: 
+                draw_main()
+                
+                # Draw trajectory canvas only if enabled
+                if SHOW_TRAJECTORY_CANVAS:
+                    traj_canvas = draw_trajectory_canvas(video_width, video_height, total)
+                    cv2.imshow("Trajectory View", traj_canvas)
+                else:
+                    # Close trajectory window if it exists
+                    try:
+                        cv2.destroyWindow("Trajectory View")
+                    except:
+                        pass
 
             key = cv2.waitKey(1) & 0xFF
             if   key == 27: break                 # Esc
@@ -582,10 +873,17 @@ def run(camera_index=0):
                 print(f"[smoothing] window -> {POSE_WIN}")
             elif key == ord('\\'):
                 print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
+            elif key == ord('t'):
+                TRAJECTORY_ENABLED = not TRAJECTORY_ENABLED
+                print(f"[trajectory] {'Enabled' if TRAJECTORY_ENABLED else 'Disabled'}")
+            elif key == ord('c'):
+                SHOW_TRAJECTORY_CANVAS = not SHOW_TRAJECTORY_CANVAS
+                print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'}")
 
     cap.release()
     cv2.destroyAllWindows()
     csv_close()
+
 
 # ================================================================
 # =================== ENTRY =====================================
