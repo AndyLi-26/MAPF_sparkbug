@@ -46,8 +46,14 @@ POSE_WIN_MAX  = 50
 POSE_WIN_MIN  = 3
 
 
+# =================== KALMAN FILTER SETTINGS ===================
+USE_KALMAN_FILTER = True      # <-- Toggle Kalman filtering
+KALMAN_PROCESS_NOISE = 0.01   # Process noise (lower = smoother but slower response)
+KALMAN_MEASUREMENT_NOISE = 5.0  # Measurement noise (higher = more smoothing)
+
+
 # =================== TRAJECTORY SETTINGS ===================
-TRAJECTORY_ENABLED = False
+TRAJECTORY_ENABLED = True
 SHOW_TRAJECTORY_CANVAS = False  # <-- Toggle separate trajectory window
 TRAJECTORY_MAX_ALPHA = 0.8    # max opacity for newest point
 TRAJECTORY_MIN_ALPHA = 0.1    # min opacity for oldest point
@@ -91,6 +97,7 @@ pose_hist      = {}           # {idx: deque([angles])}
 last_centers   = {}           # {idx: (x,y)}
 trajectories   = {}           # {idx: [(x, y, frame_num), ...]}
 stable_ids     = {}           # {idx: stable_robot_id}
+kalman_filters = {}           # {idx: KalmanFilter2D}
 
 
 LABEL2I = {'C':0,'M':1,'Y':2,'G':3}
@@ -112,7 +119,7 @@ def csv_init(path):
     _csv_f = open(path, "w", newline="")
     _csv_w = csv.writer(_csv_f)
     _csv_w.writerow([
-        "frame", "circle_idx", "x", "y",
+        "frame", "circle_idx", "x", "y", "x_filtered", "y_filtered",
         "id_stable", "id_frame", "score16", "shift",
         "front_idx", "verified",
         "angle_raw_deg", "angle_smooth_deg",
@@ -130,6 +137,8 @@ def csv_log_rows(rows):
             r.get("circle_idx"),
             r.get("x"),
             r.get("y"),
+            r.get("x_filtered"),
+            r.get("y_filtered"),
             r.get("id_stable"),
             r.get("id_frame"),
             r.get("score16"),
@@ -152,6 +161,112 @@ def csv_close():
         _csv_f.close()
     _csv_f = None
     _csv_w = None
+
+
+# ================================================================
+# =================== KALMAN FILTER ==============================
+class KalmanFilter2D:
+    """
+    Simple 2D Kalman filter for position smoothing.
+    State: [x, y, vx, vy] (position and velocity)
+    Measurement: [x, y] (position only)
+    """
+    
+    def __init__(self, process_noise=0.01, measurement_noise=5.0):
+        # State: [x, y, vx, vy]
+        self.state = np.zeros((4, 1), dtype=np.float32)
+        
+        # State covariance matrix (uncertainty in state)
+        self.P = np.eye(4, dtype=np.float32) * 1000.0
+        
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, 0, 1, 0],  # x = x + vx
+            [0, 1, 0, 1],  # y = y + vy
+            [0, 0, 1, 0],  # vx = vx
+            [0, 0, 0, 1]   # vy = vy
+        ], dtype=np.float32)
+        
+        # Measurement matrix (we only measure position)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # Process noise covariance
+        self.Q = np.eye(4, dtype=np.float32) * process_noise
+        
+        # Measurement noise covariance
+        self.R = np.eye(2, dtype=np.float32) * measurement_noise
+        
+        # Identity matrix
+        self.I = np.eye(4, dtype=np.float32)
+        
+        self.initialized = False
+    
+    def predict(self):
+        """Predict next state."""
+        # Predict state: x = F * x
+        self.state = self.F @ self.state
+        
+        # Predict covariance: P = F * P * F' + Q
+        self.P = self.F @ self.P @ self.F.T + self.Q
+    
+    def update(self, measurement):
+        """Update state with new measurement [x, y]."""
+        z = np.array([[measurement[0]], [measurement[1]]], dtype=np.float32)
+        
+        if not self.initialized:
+            # Initialize state with first measurement
+            self.state[0] = z[0]
+            self.state[1] = z[1]
+            self.state[2] = 0  # vx
+            self.state[3] = 0  # vy
+            self.initialized = True
+            return (float(z[0]), float(z[1]))
+        
+        # Predict
+        self.predict()
+        
+        # Innovation: y = z - H * x
+        y = z - self.H @ self.state
+        
+        # Innovation covariance: S = H * P * H' + R
+        S = self.H @ self.P @ self.H.T + self.R
+        
+        # Kalman gain: K = P * H' * S^-1
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        # Update state: x = x + K * y
+        self.state = self.state + K @ y
+        
+        # Update covariance: P = (I - K * H) * P
+        self.P = (self.I - K @ self.H) @ self.P
+        
+        return (float(self.state[0]), float(self.state[1]))
+    
+    def get_position(self):
+        """Get current filtered position."""
+        return (float(self.state[0]), float(self.state[1]))
+
+
+def get_or_create_kalman(idx):
+    """Get or create Kalman filter for robot index."""
+    if idx not in kalman_filters:
+        kalman_filters[idx] = KalmanFilter2D(
+            process_noise=KALMAN_PROCESS_NOISE,
+            measurement_noise=KALMAN_MEASUREMENT_NOISE
+        )
+    return kalman_filters[idx]
+
+
+def filter_position(idx, x, y):
+    """Apply Kalman filter to position."""
+    if not USE_KALMAN_FILTER:
+        return (x, y)
+    
+    kf = get_or_create_kalman(idx)
+    return kf.update((x, y))
 
 
 # ================================================================
@@ -672,21 +787,26 @@ def update(frame_idx):
         det = fit_circle(crop)
         local_center = None
         gx = gy = None
+        gx_filtered = gy_filtered = None
 
         if det is not None:
             det = np.uint16(np.around(det))
             x, y, _ = det[0][0]
             local_center = (int(x), int(y))
             gx, gy = int(x) + x1, int(y) + y1
-            circles[i]      = (gx, gy)
-            last_centers[i] = (gx, gy)
             
-            # Add to trajectory
-            add_trajectory_point(i, gx, gy, frame_idx)
+            # Apply Kalman filter to raw position
+            gx_filtered, gy_filtered = filter_position(i, gx, gy)
+            
+            circles[i]      = (int(gx_filtered), int(gy_filtered))
+            last_centers[i] = (int(gx_filtered), int(gy_filtered))
+            
+            # Add filtered position to trajectory
+            add_trajectory_point(i, gx_filtered, gy_filtered, frame_idx)
         else:
             if i in last_centers:
-                gx, gy = last_centers[i]
-                add_trajectory_point(i, gx, gy, frame_idx)
+                gx_filtered, gy_filtered = last_centers[i]
+                add_trajectory_point(i, gx_filtered, gy_filtered, frame_idx)
 
         led = None
         if local_center is not None:
@@ -703,6 +823,8 @@ def update(frame_idx):
             "frame": frame_idx, "circle_idx": i,
             "x": gx if gx is not None else "",
             "y": gy if gy is not None else "",
+            "x_filtered": gx_filtered if gx_filtered is not None else "",
+            "y_filtered": gy_filtered if gy_filtered is not None else "",
             "id_stable": "", "id_frame": "", "score16": "", "shift": "",
             "front_idx": "", "verified": "",
             "angle_raw_deg": pose_raw_deg.get(i, ""),
@@ -731,10 +853,15 @@ def update(frame_idx):
                     if sm is not None:
                         pose_smooth[i] = sm
 
-                # Terminal status (unchanged)
-                gx_s = "None" if gx is None else str(int(gx))
-                gy_s = "None" if gy is None else str(int(gy))
-                print(f"[circle {i}] ID(stable)={stable_id+1:02d}  x={gx_s} y={gy_s}  "
+                # Terminal status
+                gx_s = "None" if gx is not None else str(int(gx))
+                gy_s = "None" if gy is not None else str(int(gy))
+                gxf_s = f"{gx_filtered:.1f}" if gx_filtered is not None else "None"
+                gyf_s = f"{gy_filtered:.1f}" if gy_filtered is not None else "None"
+                
+                kalman_status = "K" if USE_KALMAN_FILTER else ""
+                print(f"[circle {i}] ID(stable)={stable_id+1:02d}  "
+                      f"pos=({gxf_s}, {gyf_s}){kalman_status}  "
                       f"(frame id={rid+1:02d}, score={sc}/16, shift={sh})")
 
                 # Populate row for CSV
@@ -774,11 +901,11 @@ def list_cameras(max_tested=10):
 
 
 def run(camera_index=0):
-    global frame, setup, new_circles, paused, POSE_WIN, SHOW_TRAJECTORY_CANVAS
+    global frame, setup, new_circles, paused, POSE_WIN, SHOW_TRAJECTORY_CANVAS, USE_KALMAN_FILTER
     csv_init(CSV_PATH)
 
     if camera_index == -1:
-        cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_mult_2.mov")
+        cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_multiple.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
@@ -794,6 +921,8 @@ def run(camera_index=0):
     print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
     print(f"[trajectory] Enabled with fading (alpha: {TRAJECTORY_MIN_ALPHA}-{TRAJECTORY_MAX_ALPHA})")
     print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'} (toggle with 'c' key)")
+    print(f"[kalman filter] {'Enabled' if USE_KALMAN_FILTER else 'Disabled'} (toggle with 'k' key)")
+    print(f"   Process noise: {KALMAN_PROCESS_NOISE}, Measurement noise: {KALMAN_MEASUREMENT_NOISE}")
 
     total, t0 = 0, 0
     while True:
@@ -879,6 +1008,12 @@ def run(camera_index=0):
             elif key == ord('c'):
                 SHOW_TRAJECTORY_CANVAS = not SHOW_TRAJECTORY_CANVAS
                 print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'}")
+            elif key == ord('k'):
+                USE_KALMAN_FILTER = not USE_KALMAN_FILTER
+                # Reset Kalman filters when toggling
+                if USE_KALMAN_FILTER:
+                    kalman_filters.clear()
+                print(f"[kalman filter] {'Enabled' if USE_KALMAN_FILTER else 'Disabled'}")
 
     cap.release()
     cv2.destroyAllWindows()
