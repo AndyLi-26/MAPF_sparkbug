@@ -1,19 +1,23 @@
+from pickle import TRUE
 import cv2, time, sys, math, csv, os
 import numpy as np
 from collections import deque
 import database
 
 
+
 # =================== GLOBAL SETTINGS ===================
 DEBUG = False
 SHOW  = True
 LIGHT = False                 # set True if using saturation-based circle fit
-R     = 45                    # ring radius in px (≈60 @ 1080p, ≈100 @ 4k)
+R     = 45                  # ring radius in px (≈60 @ 1080p, ≈100 @ 4k)
 MIN_DIST = R * 1.8
+
 
 
 SAT_GAIN   = 2.5
 SAT_CUTOFF = 130
+
 
 
 # =================== LED RING CONFIG ===================
@@ -28,6 +32,7 @@ TINY_REFINE_R = 2
 TH_STEP_DEG   = 2.0
 
 
+
 # Hue bands (OpenCV hue 0..179)
 HUE_BANDS = {
     'Y': [(0, 50), (145, 180)],
@@ -35,6 +40,7 @@ HUE_BANDS = {
     'C': [(100, 105)],
     'M': [(115, 140)],
 }
+
 
 
 # =================== SMOOTHING (runtime [ / ]) ===================
@@ -46,19 +52,23 @@ POSE_WIN_MAX  = 50
 POSE_WIN_MIN  = 3
 
 
+
 # =================== KALMAN FILTER SETTINGS ===================
 USE_KALMAN_FILTER = True      # <-- Toggle Kalman filtering
 KALMAN_PROCESS_NOISE = 0.01   # Process noise (lower = smoother but slower response)
 KALMAN_MEASUREMENT_NOISE = 5.0  # Measurement noise (higher = more smoothing)
 
 
+
 # =================== TRAJECTORY SETTINGS ===================
 TRAJECTORY_ENABLED = True
 SHOW_TRAJECTORY_CANVAS = False  # <-- Toggle separate trajectory window
+TRAJECTORY_SAMPLE_INTERVAL = 6  # <-- NEW: Record trajectory every N frames
 TRAJECTORY_MAX_ALPHA = 0.8    # max opacity for newest point
 TRAJECTORY_MIN_ALPHA = 0.1    # min opacity for oldest point
 TRAJECTORY_LINE_THICKNESS = 2
 TRAJECTORY_FADE_POWER = 1.5   # exponential fade (higher = faster fade)
+
 
 # Distinctive color palette for up to 20 robots (BGR format)
 ROBOT_COLORS = [
@@ -85,6 +95,7 @@ ROBOT_COLORS = [
 ]
 
 
+
 # =================== RUNTIME STATE ===================
 setup          = False
 frame          = None
@@ -96,11 +107,14 @@ pose_smooth    = {}           # {idx: last smoothed pose}
 pose_hist      = {}           # {idx: deque([angles])}
 last_centers   = {}           # {idx: (x,y)}
 trajectories   = {}           # {idx: [(x, y, frame_num), ...]}
+trajectory_frame_counter = {} # {idx: frame count since last trajectory point}
 stable_ids     = {}           # {idx: stable_robot_id}
 kalman_filters = {}           # {idx: KalmanFilter2D}
 
 
+
 LABEL2I = {'C':0,'M':1,'Y':2,'G':3}
+
 
 
 # =================== CSV LOGGING ===================
@@ -108,6 +122,7 @@ LOG_CSV  = False                     # <-- toggle logging here
 CSV_PATH = "robot_frames_log.csv"   # output file
 _csv_f   = None
 _csv_w   = None
+
 
 
 def csv_init(path):
@@ -126,6 +141,7 @@ def csv_init(path):
         "front_v", "front_hue",
         "labels_string"
     ])
+
 
 
 def csv_log_rows(rows):
@@ -153,6 +169,7 @@ def csv_log_rows(rows):
         ])
 
 
+
 def csv_close():
     """Close CSV cleanly."""
     global _csv_f, _csv_w
@@ -161,6 +178,7 @@ def csv_close():
         _csv_f.close()
     _csv_f = None
     _csv_w = None
+
 
 
 # ================================================================
@@ -250,6 +268,7 @@ class KalmanFilter2D:
         return (float(self.state[0]), float(self.state[1]))
 
 
+
 def get_or_create_kalman(idx):
     """Get or create Kalman filter for robot index."""
     if idx not in kalman_filters:
@@ -258,6 +277,7 @@ def get_or_create_kalman(idx):
             measurement_noise=KALMAN_MEASUREMENT_NOISE
         )
     return kalman_filters[idx]
+
 
 
 def filter_position(idx, x, y):
@@ -269,6 +289,7 @@ def filter_position(idx, x, y):
     return kf.update((x, y))
 
 
+
 # ================================================================
 # =================== TRAJECTORY FUNCTIONS =======================
 def get_robot_color(idx):
@@ -276,11 +297,36 @@ def get_robot_color(idx):
     return ROBOT_COLORS[idx % len(ROBOT_COLORS)]
 
 
+
 def add_trajectory_point(idx, x, y, frame_num):
-    """Add a point to robot's trajectory."""
-    if idx not in trajectories:
-        trajectories[idx] = []
-    trajectories[idx].append((int(x), int(y), frame_num))
+    """Add a point to robot's trajectory (sampled at intervals)."""
+    if idx not in trajectory_frame_counter:
+        trajectory_frame_counter[idx] = 0
+    
+    # Only add point every TRAJECTORY_SAMPLE_INTERVAL frames
+    trajectory_frame_counter[idx] += 1
+    
+    if trajectory_frame_counter[idx] >= TRAJECTORY_SAMPLE_INTERVAL:
+        if idx not in trajectories:
+            trajectories[idx] = []
+        trajectories[idx].append((int(x), int(y), frame_num))
+        trajectory_frame_counter[idx] = 0  # Reset counter
+
+
+
+def reset_trajectory_counters():
+    """Reset trajectory counters (call when enabling/disabling trajectory)."""
+    global trajectory_frame_counter
+    trajectory_frame_counter.clear()
+
+
+
+def clear_trajectories():
+    """Clear all trajectory history."""
+    global trajectories, trajectory_frame_counter
+    trajectories.clear()
+    trajectory_frame_counter.clear()
+
 
 
 def draw_trajectories(img, current_frame):
@@ -308,6 +354,7 @@ def draw_trajectories(img, current_frame):
             overlay = img.copy()
             cv2.line(overlay, (x1, y1), (x2, y2), color, TRAJECTORY_LINE_THICKNESS, cv2.LINE_AA)
             cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
 
 
 def draw_legend(img):
@@ -345,10 +392,12 @@ def draw_legend(img):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+
 def create_trajectory_canvas(width, height):
     """Create a separate canvas for trajectory visualization."""
     canvas = np.ones((height, width, 3), dtype=np.uint8) * 240  # Light gray background
     return canvas
+
 
 
 def draw_trajectory_canvas(width, height, current_frame):
@@ -416,6 +465,7 @@ def draw_trajectory_canvas(width, height, current_frame):
     return canvas
 
 
+
 def draw_legend_trajectory_canvas(canvas):
     """Draw legend on trajectory canvas."""
     if not stable_ids:
@@ -459,6 +509,7 @@ def draw_legend_trajectory_canvas(canvas):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
 
+
 # ================================================================
 # =================== CORE GEOM / ANGLES =========================
 def ang_norm(a):
@@ -466,8 +517,10 @@ def ang_norm(a):
     return a + 360.0 if a < 0 else a
 
 
+
 def ang_diff(a, b):
     return (a - b + 180.0) % 360.0 - 180.0
+
 
 
 def circ_mean_deg(angles):
@@ -479,9 +532,11 @@ def circ_mean_deg(angles):
     return ang_norm(math.degrees(math.atan2(s, c)))
 
 
+
 def angle_of(cx, cy, x, y):
     a = math.degrees(math.atan2(y - cy, x - cx))
     return a + 360.0 if a < 0 else a
+
 
 
 # ================================================================
@@ -490,6 +545,7 @@ def fit_circle(img):
     if img is None or img.size == 0:
         return None
     return fit_bright(img) if LIGHT else fit_dark(img)
+
 
 
 def fit_bright(img):
@@ -505,6 +561,7 @@ def fit_bright(img):
     )
 
 
+
 def fit_dark(img):
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     g = np.where(g < SAT_CUTOFF, 0, g)
@@ -513,6 +570,7 @@ def fit_dark(img):
         blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=MIN_DIST,
         param1=10, param2=25, minRadius=8, maxRadius=150
     )
+
 
 
 def crop_bounds(center, img):
@@ -524,6 +582,7 @@ def crop_bounds(center, img):
     if x2 < x1: x1, x2 = x2, x1
     if y2 < y1: y1, y2 = y2, y1
     return y1, y2, x1, x2
+
 
 
 # ================================================================
@@ -549,6 +608,7 @@ def sample_v_stat(V, x0, y0, r, stat='median'):
     else:                  return float(np.mean(arr))
 
 
+
 def find_bright_theta(V, cx, cy, r_mid, step_deg):
     best_t, best_v = None, -1.0
     for t in np.arange(0.0, 360.0, step_deg):
@@ -557,6 +617,7 @@ def find_bright_theta(V, cx, cy, r_mid, step_deg):
         v = sample_v_stat(V, x, y, BLOB_R, stat='median')
         if v > best_v: best_v, best_t = v, t
     return best_t if best_t is not None else (THETA0_DEG % 360.0)
+
 
 
 def refine_local_max(V, x0, y0, r, bounds_wh):
@@ -581,6 +642,7 @@ def refine_local_max(V, x0, y0, r, bounds_wh):
     return best_xy[0], best_xy[1], best_v
 
 
+
 def hue_median(H, V, x0, y0, r, v_min):
     h, w = H.shape
     y_min, y_max = max(0, y0 - r), min(h - 1, y0 + r)
@@ -599,6 +661,7 @@ def hue_median(H, V, x0, y0, r, v_min):
     return float(np.median(np.asarray(vals, dtype=np.float32)))
 
 
+
 def classify_hue(h):
     if h < 0: return 'C'
     for lab, ranges in HUE_BANDS.items():
@@ -612,22 +675,27 @@ def classify_hue(h):
     return best_lab or 'C'
 
 
+
 def analyze_ring(crop_bgr, center_xy, approx_r):
     cx, cy = map(int, center_xy)
     hsv    = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     H, V   = hsv[:, :, 0], hsv[:, :, 2]
 
+
     r_in, r_out = ANN_INNER * approx_r, ANN_OUTER * approx_r
     r_mid       = 0.5 * (r_in + r_out)
 
+
     theta0 = find_bright_theta(V, cx, cy, r_mid, TH_STEP_DEG)
     step   = (360.0 / N_LEDS) * DIR
+
 
     out, h, w = [], *crop_bgr.shape[:2]
     for k in range(N_LEDS):
         th = math.radians(theta0 + k * step)
         nx = int(round(cx + r_mid * math.cos(th)))
         ny = int(round(cy + r_mid * math.sin(th)))
+
 
         rx, ry, vpk = refine_local_max(V, nx, ny, TINY_REFINE_R, (w, h))
         hmed        = hue_median(H, V, rx, ry, BLOB_R, MIN_V)
@@ -636,10 +704,12 @@ def analyze_ring(crop_bgr, center_xy, approx_r):
     return out
 
 
+
 # ================================================================
 # =================== ROTATION-AWARE ID & POSE ====================
 def rot(seq, k): k %= len(seq); return seq[k:] + seq[:k]
 def score(a, b): return sum(1 for x, y in zip(a, b) if x == y)
+
 
 
 def best_match(labels, sequences):
@@ -654,8 +724,10 @@ def best_match(labels, sequences):
     return best_id, best_sc, best_sh
 
 
+
 def front_from_shift(shift, n): return (-shift) % n
 def _wrap(i, n): return (i % n + n) % n
+
 
 
 def neighbor_score(obs, canon, idx, win=2):
@@ -664,6 +736,7 @@ def neighbor_score(obs, canon, idx, win=2):
         if obs[_wrap(idx + off, n)] == canon[_wrap(0 + off, n)]:
             s += 1
     return s
+
 
 
 def best_front_index(labels, canon, win=2):
@@ -675,13 +748,16 @@ def best_front_index(labels, canon, win=2):
     return best_i, best_s
 
 
+
 def compute_pose(led_info, labels, rid, shift, center_xy, verify=True, min_ok=3):
     if rid is None or rid < 0 or (led_info is None) or len(led_info) != N_LEDS:
         return None, None, False
 
+
     cx, cy  = map(int, center_xy)
     canon   = database.SEQUENCES[rid]          # ints 0..3
     obs_int = [LABEL2I.get(ch, 0) for ch in labels]
+
 
     front = front_from_shift(shift, N_LEDS)
     ok    = True
@@ -691,9 +767,11 @@ def compute_pose(led_info, labels, rid, shift, center_xy, verify=True, min_ok=3)
             front  = j2
             ok     = s2 >= min_ok
 
+
     rx, ry = led_info[front]['refined']
     pose   = angle_of(cx, cy, rx, ry)
     return pose, front, ok
+
 
 
 # ================================================================
@@ -708,6 +786,7 @@ def pose_push(i, pose_deg):
     dq.append(pose_deg)
 
 
+
 def pose_get(i):
     if i not in pose_hist or len(pose_hist[i]) == 0: return None
     arr    = list(pose_hist[i])
@@ -715,6 +794,7 @@ def pose_get(i):
     arr.sort(key=lambda a: abs(ang_diff(a, latest)))
     k = max(1, min(len(arr), max(POSE_MIN_KEEP, int(math.ceil(POSE_KEEP_FR * len(arr))))))
     return circ_mean_deg(arr[:k])
+
 
 
 # ================================================================
@@ -728,17 +808,21 @@ def on_click(event, x, y, *_):
         if DEBUG: print("Clicked:", (x, y))
 
 
+
 def draw_main():
     if frame is None or frame.size == 0: return
     vis = frame.copy()
+
 
     for x, y in new_circles:
         cv2.circle(vis, (x, y), int(R), (255, 255, 0), 2)
         cv2.circle(vis, (x, y), 2, (0, 0, 255), 3)
 
+
     for idx, (x, y) in enumerate(circles):
         cv2.circle(vis, (x, y), int(R), (0, 255, 0), 2)
         cv2.circle(vis, (x, y), 2, (0, 0, 255), 3)
+
 
         if idx in id_counts and id_counts[idx]:
             sid = max(id_counts[idx], key=id_counts[idx].get) + 1
@@ -747,6 +831,7 @@ def draw_main():
             cv2.rectangle(vis, tl, br, (0, 255, 0), 2)
             cv2.putText(vis, f"ID:{sid}", (x - R, y - R - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
 
         ang = pose_smooth.get(idx, pose_raw_deg.get(idx))
         if ang is not None:
@@ -759,13 +844,16 @@ def draw_main():
             cv2.putText(vis, f"{ang:5.1f} deg", (p1[0] + 8, p1[1]),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
 
+
     # Draw trajectories with fading
     draw_trajectories(vis, 0)  # frame number not used currently
     
     # Draw legend
     draw_legend(vis)
 
+
     cv2.imshow("Circle Detection", vis)
+
 
 
 # ================================================================
@@ -775,19 +863,23 @@ def update(frame_idx):
     global pose_raw_deg, pose_smooth, last_centers, stable_ids
     rows = []
 
+
     for i, c in enumerate(circles):
         y1, y2, x1, x2 = crop_bounds(c, frame)
         if (y2 - y1) <= 1 or (x2 - x1) <= 1:
             if DEBUG: print("Skip tiny crop"); continue
 
+
         crop = frame[y1:y2, x1:x2]
         if crop is None or crop.size == 0:
             if DEBUG: print("Empty crop"); continue
+
 
         det = fit_circle(crop)
         local_center = None
         gx = gy = None
         gx_filtered = gy_filtered = None
+
 
         if det is not None:
             det = np.uint16(np.around(det))
@@ -801,12 +893,13 @@ def update(frame_idx):
             circles[i]      = (int(gx_filtered), int(gy_filtered))
             last_centers[i] = (int(gx_filtered), int(gy_filtered))
             
-            # Add filtered position to trajectory
+            # Add filtered position to trajectory (sampled)
             add_trajectory_point(i, gx_filtered, gy_filtered, frame_idx)
         else:
             if i in last_centers:
                 gx_filtered, gy_filtered = last_centers[i]
                 add_trajectory_point(i, gx_filtered, gy_filtered, frame_idx)
+
 
         led = None
         if local_center is not None:
@@ -817,6 +910,7 @@ def update(frame_idx):
                     print(f"LED[{i}] -> {labs}")
             except Exception as e:
                 if DEBUG: print("LED ring error:", e)
+
 
         # Defaults for logging in case we can't compute this frame
         row = {
@@ -832,16 +926,19 @@ def update(frame_idx):
             "front_v": "", "front_hue": "", "labels_string": ""
         }
 
+
         if led is not None:
             labels = [p['label'] for p in led]
             row["labels_string"] = ''.join(labels)
             try:
                 rid, sc, sh = best_match(labels, database.SEQUENCES)
 
+
                 if i not in id_counts: id_counts[i] = {}
                 id_counts[i][rid] = id_counts[i].get(rid, 0) + 1
                 stable_id = max(id_counts[i], key=id_counts[i].get)
                 stable_ids[i] = stable_id  # Store for legend
+
 
                 pose_deg, front_idx, ok = compute_pose(
                     led, labels, rid, sh, local_center, verify=True, min_ok=3
@@ -853,6 +950,7 @@ def update(frame_idx):
                     if sm is not None:
                         pose_smooth[i] = sm
 
+
                 # Terminal status
                 gx_s = "None" if gx is not None else str(int(gx))
                 gy_s = "None" if gy is not None else str(int(gy))
@@ -863,6 +961,7 @@ def update(frame_idx):
                 print(f"[circle {i}] ID(stable)={stable_id+1:02d}  "
                       f"pos=({gxf_s}, {gyf_s}){kalman_status}  "
                       f"(frame id={rid+1:02d}, score={sc}/16, shift={sh})")
+
 
                 # Populate row for CSV
                 row.update({
@@ -876,16 +975,21 @@ def update(frame_idx):
                     "angle_smooth_deg": pose_smooth.get(i, "")
                 })
 
+
                 if front_idx is not None:
                     row["front_v"]   = led[front_idx]['v']
                     row["front_hue"] = led[front_idx]['hue']
 
+
             except Exception as e:
                 print("Robot ID/pose error:", e)
 
+
         rows.append(row)
 
+
     return rows
+
 
 
 # ================================================================
@@ -900,29 +1004,37 @@ def list_cameras(max_tested=10):
     return found
 
 
+
 def run(camera_index=0):
-    global frame, setup, new_circles, paused, POSE_WIN, SHOW_TRAJECTORY_CANVAS, USE_KALMAN_FILTER
+    global frame, setup, new_circles, paused, POSE_WIN, SHOW_TRAJECTORY_CANVAS, USE_KALMAN_FILTER, TRAJECTORY_ENABLED
     csv_init(CSV_PATH)
+
 
     if camera_index == -1:
         cap = cv2.VideoCapture("bright.mov" if LIGHT else "dark_multiple.mov")
     else:
         cap = cv2.VideoCapture(camera_index)
 
+
     if not cap.isOpened():
         print(f"Error: Cannot open camera {camera_index}")
         csv_close()
         return
 
+
     # Get video dimensions for trajectory canvas
     video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+
     print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
     print(f"[trajectory] Enabled with fading (alpha: {TRAJECTORY_MIN_ALPHA}-{TRAJECTORY_MAX_ALPHA})")
+    print(f"[trajectory sampling] Every {TRAJECTORY_SAMPLE_INTERVAL} frames")
     print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'} (toggle with 'c' key)")
     print(f"[kalman filter] {'Enabled' if USE_KALMAN_FILTER else 'Disabled'} (toggle with 'k' key)")
     print(f"   Process noise: {KALMAN_PROCESS_NOISE}, Measurement noise: {KALMAN_MEASUREMENT_NOISE}")
+    print(f"[controls] 't'=toggle trajectory, 'c'=canvas, 'k'=kalman, 'r'=clear history, '['']'=smoothing, Space=pause, Esc=exit")
+
 
     total, t0 = 0, 0
     while True:
@@ -933,6 +1045,7 @@ def run(camera_index=0):
                     dt = time.time() - t0
                     if dt > 0: print(f"fps: {total/dt}")
                 print("Failed to grab frame"); break
+
 
             frame = f
             total += 1
@@ -946,8 +1059,10 @@ def run(camera_index=0):
                     cv2.circle(frame, (nx, ny), int(R), (255, 255, 0), 2)
                     cv2.circle(frame, (nx, ny), 2, (0, 0, 255), 3)
 
+
             cv2.imshow("Circle Detection", frame)
             cv2.setMouseCallback("Circle Detection", on_click)
+
 
             key = cv2.waitKey(0) & 0xFF
             if key == 13:      # Enter
@@ -971,10 +1086,12 @@ def run(camera_index=0):
                     print("Failed to grab frame"); break
                 total += 1
 
+
             # ==== process + CSV log ====
             rows = update(total)
             if LOG_CSV and rows:
                 csv_log_rows(rows)
+
 
             if SHOW: 
                 draw_main()
@@ -990,6 +1107,7 @@ def run(camera_index=0):
                     except:
                         pass
 
+
             key = cv2.waitKey(1) & 0xFF
             if   key == 27: break                 # Esc
             elif key == ord(' '):
@@ -1004,10 +1122,14 @@ def run(camera_index=0):
                 print(f"[smoothing] window={POSE_WIN}, keep_frac={POSE_KEEP_FR}, min_keep={POSE_MIN_KEEP}")
             elif key == ord('t'):
                 TRAJECTORY_ENABLED = not TRAJECTORY_ENABLED
+                reset_trajectory_counters()
                 print(f"[trajectory] {'Enabled' if TRAJECTORY_ENABLED else 'Disabled'}")
             elif key == ord('c'):
                 SHOW_TRAJECTORY_CANVAS = not SHOW_TRAJECTORY_CANVAS
                 print(f"[trajectory canvas] {'Enabled' if SHOW_TRAJECTORY_CANVAS else 'Disabled'}")
+            elif key == ord('r'):
+                clear_trajectories()
+                print("[trajectory] History cleared")
             elif key == ord('k'):
                 USE_KALMAN_FILTER = not USE_KALMAN_FILTER
                 # Reset Kalman filters when toggling
@@ -1015,9 +1137,11 @@ def run(camera_index=0):
                     kalman_filters.clear()
                 print(f"[kalman filter] {'Enabled' if USE_KALMAN_FILTER else 'Disabled'}")
 
+
     cap.release()
     cv2.destroyAllWindows()
     csv_close()
+
 
 
 # ================================================================
